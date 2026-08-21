@@ -207,3 +207,10 @@ DDT_D1_CFG = ArticulationCfg(
         ),
     },
 )
+
+
+DDT_D1BOX_CFG = DDT_D1_CFG.replace(
+    spawn=DDT_D1_CFG.spawn.replace(
+        asset_path=f"{DDT_MODEL_DIR}/d1_description/urdf/robot_box.urdf",
+    ),
+)

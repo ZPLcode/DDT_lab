@@ -109,7 +109,7 @@ gym.register(
 
 gym.register(
     id="DDT-Velocity-Platform-D1-NP3O-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=_np3o_platform.D1PlatformRLEnv,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": _np3o_platform.D1PlatformNP3OEnvCfg,
@@ -119,7 +119,7 @@ gym.register(
 
 gym.register(
     id="DDT-Velocity-Platform-D1-NP3O-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=_np3o_platform.D1PlatformRLEnv,
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": _np3o_platform.D1PlatformNP3OEnvCfg_PLAY,

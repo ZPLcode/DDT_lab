@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.math as math_utils
@@ -17,6 +18,7 @@ from isaaclab.envs import mdp
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
+from .platform_utils import platform_terrain_type_masks
 from .utils import is_robot_on_terrain
 
 if TYPE_CHECKING:
@@ -112,6 +114,94 @@ class UniformThresholdVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
     pit_terrain_names: tuple[str, ...] = ("pits", "rails", "boxes")
     """Sub-terrain names (keys in ``TerrainGeneratorCfg.sub_terrains``) that should restrict the
     velocity command to forward-only movement (see :meth:`UniformThresholdVelocityCommand._update_command`)."""
+
+
+class TerrainAwareVelocityCommand(mdp.UniformVelocityCommand):
+    """Use dedicated velocity ranges on platform terrain columns."""
+
+    cfg: TerrainAwareVelocityCommandCfg
+
+    def __init__(self, cfg: TerrainAwareVelocityCommandCfg, env: ManagerBasedEnv):
+        if not 0.0 <= cfg.platform_terrain_start < 1.0:
+            raise ValueError("platform_terrain_start must be in [0, 1).")
+        if cfg.planar_deadzone < 0.0:
+            raise ValueError("planar_deadzone must be non-negative.")
+        if (cfg.platform_descent_terrain_start is None) != (cfg.platform_descent_ranges is None):
+            raise ValueError("platform_descent_terrain_start and platform_descent_ranges must be set together.")
+        if cfg.platform_descent_terrain_start is not None:
+            if not cfg.platform_terrain_start < cfg.platform_descent_terrain_start < 1.0:
+                raise ValueError("platform_descent_terrain_start must follow platform_terrain_start and be below 1.")
+            if cfg.platform_descent_bidirectional:
+                descent_x_range = cfg.platform_descent_ranges.lin_vel_x
+                if not 0.0 < descent_x_range[0] <= descent_x_range[1]:
+                    raise ValueError("Bidirectional descent requires a positive lin_vel_x magnitude range.")
+        super().__init__(cfg, env)
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        super()._resample_command(env_ids)
+
+        if self.cfg.planar_deadzone > 0.0:
+            moving = torch.linalg.norm(self.vel_command_b[env_ids, :2], dim=1) > self.cfg.planar_deadzone
+            self.vel_command_b[env_ids, :2] *= moving.unsqueeze(1)
+
+        terrain = self._env.scene.terrain
+        terrain_generator = terrain.cfg.terrain_generator
+        if terrain_generator is None or not hasattr(terrain, "terrain_types"):
+            return
+
+        platform_mask, descent_mask = platform_terrain_type_masks(
+            terrain.terrain_types[env_ids],
+            terrain_generator.num_cols,
+            self.cfg.platform_terrain_start,
+            self.cfg.platform_descent_terrain_start,
+        )
+        platform_env_ids = env_ids[platform_mask]
+        if len(platform_env_ids) == 0:
+            return
+
+        samples = torch.empty(len(platform_env_ids), device=self.device)
+        self.vel_command_b[platform_env_ids, 0] = samples.uniform_(*self.cfg.platform_ranges.lin_vel_x)
+        self.vel_command_b[platform_env_ids, 1] = samples.uniform_(*self.cfg.platform_ranges.lin_vel_y)
+        self.heading_target[platform_env_ids] = samples.uniform_(*self.cfg.platform_ranges.heading)
+        self.is_heading_env[platform_env_ids] = True
+        self.is_standing_env[platform_env_ids] = False
+
+        if self.cfg.platform_descent_terrain_start is None:
+            return
+
+        descent_env_ids = env_ids[descent_mask]
+        if len(descent_env_ids) == 0:
+            return
+
+        descent_ranges = self.cfg.platform_descent_ranges
+        samples = torch.empty(len(descent_env_ids), device=self.device)
+        descent_x = samples.uniform_(*descent_ranges.lin_vel_x)
+        if self.cfg.platform_descent_bidirectional:
+            signs = torch.randint(0, 2, (len(descent_env_ids),), device=self.device).mul_(2).sub_(1)
+            descent_x *= signs
+        self.vel_command_b[descent_env_ids, 0] = descent_x
+        self.vel_command_b[descent_env_ids, 1] = samples.uniform_(*descent_ranges.lin_vel_y)
+        self.heading_target[descent_env_ids] = samples.uniform_(*descent_ranges.heading)
+
+
+@configclass
+class TerrainAwareVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
+    """Configuration for terrain-conditioned velocity sampling."""
+
+    @configclass
+    class PlatformRanges:
+        lin_vel_x: tuple[float, float] = MISSING
+        lin_vel_y: tuple[float, float] = MISSING
+        heading: tuple[float, float] = MISSING
+
+    class_type: type = TerrainAwareVelocityCommand
+    platform_terrain_start: float = MISSING
+    planar_deadzone: float = 0.0
+    platform_ranges: PlatformRanges = MISSING
+    platform_descent_terrain_start: float | None = None
+    platform_descent_ranges: PlatformRanges | None = None
+    platform_descent_bidirectional: bool = False
 
 
 class DiscreteCommandController(CommandTerm):

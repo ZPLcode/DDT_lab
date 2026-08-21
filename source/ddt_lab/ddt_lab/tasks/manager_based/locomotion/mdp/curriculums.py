@@ -19,12 +19,18 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
+from .platform_utils import platform_terrain_type_start_index
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv, RLTaskEnv
 
 
 def terrain_levels_vel(
-    env: RLTaskEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: RLTaskEnv,
+    env_ids: Sequence[int],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    move_up_terrain_type_start: float | None = None,
+    move_up_distance_override: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Curriculum based on the distance the robot walked when commanded to move at a desired velocity.
 
@@ -43,10 +49,28 @@ def terrain_levels_vel(
     asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
     command = env.command_manager.get_command("base_velocity")
+    if (move_up_terrain_type_start is None) != (move_up_distance_override is None):
+        raise ValueError("move_up_terrain_type_start and move_up_distance_override must be set together.")
+    if move_up_terrain_type_start is not None and not 0.0 <= move_up_terrain_type_start < 1.0:
+        raise ValueError("move_up_terrain_type_start must be in [0, 1).")
+    if move_up_distance_override is not None and move_up_distance_override <= 0.0:
+        raise ValueError("move_up_distance_override must be positive.")
     # compute the distance the robot walked
     distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
     # robots that walked far enough progress to harder terrains
-    move_up = distance > terrain.cfg.terrain_generator.size[0] / 2
+    move_up_distance = torch.full_like(distance, terrain.cfg.terrain_generator.size[0] / 2)
+    if move_up_terrain_type_start is not None:
+        terrain_type_min = platform_terrain_type_start_index(
+            move_up_terrain_type_start,
+            terrain.cfg.terrain_generator.num_cols,
+        )
+        override_mask = terrain.terrain_types[env_ids] >= terrain_type_min
+        move_up_distance = torch.where(
+            override_mask,
+            torch.full_like(move_up_distance, move_up_distance_override),
+            move_up_distance,
+        )
+    move_up = distance > move_up_distance
     # robots that walked less than half of their required distance go to simpler terrains
     move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5
     move_down *= ~move_up
@@ -110,6 +134,28 @@ def command_levels_lin_vel(
             base_velocity_ranges.lin_vel_x = new_vel_x.tolist()
             base_velocity_ranges.lin_vel_y = new_vel_y.tolist()
 
+    return torch.tensor(base_velocity_ranges.lin_vel_x[1], device=env.device)
+
+
+def command_levels_lin_vel_x(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    reward_term_name: str,
+    max_curriculum: float = 1.5,
+    increment: float = 0.5,
+) -> torch.Tensor:
+    """Expand only the commanded X-velocity range."""
+    base_velocity_ranges = env.command_manager.get_term("base_velocity").cfg.ranges
+    if env.common_step_counter % env.max_episode_length == 0:
+        episode_sums = env.reward_manager._episode_sums[reward_term_name]
+        reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
+        mean_tracking_reward = torch.mean(episode_sums[env_ids]) / env.max_episode_length_s
+        if mean_tracking_reward > 0.8 * reward_term_cfg.weight:
+            lower, upper = base_velocity_ranges.lin_vel_x
+            base_velocity_ranges.lin_vel_x = (
+                max(float(lower) - increment, -max_curriculum),
+                min(float(upper) + increment, max_curriculum),
+            )
     return torch.tensor(base_velocity_ranges.lin_vel_x[1], device=env.device)
 
 

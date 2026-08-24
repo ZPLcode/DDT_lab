@@ -37,4 +37,7 @@ def d1_platform_np3o_runner_cfg() -> dict:
     cfg = d1_rough_np3o_runner_cfg()
     cfg["runner"]["experiment_name"] = "d1_platform"
     cfg["runner"]["max_iterations"] = 20000
+    cfg["algorithm"]["use_symmetry"] = True
+    cfg["algorithm"]["use_fa_symmetry"] = False
+    cfg["algorithm"]["mirror_coef"] = 0.5
     return cfg

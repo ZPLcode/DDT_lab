@@ -14,6 +14,8 @@ from ddt_lab.assets.terrains.platform import (
     D1_HIGH_PLATFORM_TERRAINS_CFG,
     D1_PLATFORM_DESCENT_TERRAIN_START,
     D1_PLATFORM_TERRAIN_START,
+    D1_SLOPE_TERRAIN_START,
+    D1_STAIRS_TERRAIN_START,
 )
 from ddt_lab.managers import CostTermCfg
 from isaaclab.envs import ManagerBasedRLEnv
@@ -22,25 +24,10 @@ from isaaclab.managers import RewardManager
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
 from ..base_env_cfg import CommandsCfg, SceneCfg, TerminationsCfg
 from .rough_env_cfg import CostsCfg, D1RoughNP3OEnvCfg, RoughRewardsCfg
-
-
-@configclass
-class PlatformSceneCfg(SceneCfg):
-    """D1 platform scene with an all-terrain-style body-footprint scanner."""
-
-    body_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base_link",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.05, size=(0.75, 0.23)),
-        debug_vis=False,
-        mesh_prim_paths=["/World/ground"],
-    )
 
 
 class PlatformRewardManager(RewardManager):
@@ -179,33 +166,47 @@ class PlatformRewardsCfg(RoughRewardsCfg):
         params=_platform_term_params(),
     )
     lin_vel_z_l2 = RewTerm(
-        func=mdp.platform_discontinuity_gated_lin_vel_z_l2,
+        func=mdp.lin_vel_z_l2,
         weight=-2.0,
         params={
-            "sensor_cfg": SceneEntityCfg("body_scanner"),
-            "discontinuity_height": 0.06,
-            "discontinuity_std": 0.015,
             "asset_cfg": SceneEntityCfg("robot"),
+            "exclude_terrain_type_start": D1_STAIRS_TERRAIN_START,
         },
     )
     base_height_l2 = RewTerm(
-        func=mdp.platform_terrain_gated_base_height_l2,
+        func=mdp.base_height_l2,
         weight=-2.0,
         params={
             "target_height": 0.52,
-            "sensor_cfg": SceneEntityCfg("body_scanner"),
-            "plane_residual_gate_std": 0.03,
+            "sensor_cfg": SceneEntityCfg("height_scanner_base"),
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "exclude_terrain_type_start": D1_PLATFORM_TERRAIN_START,
         },
     )
-    terrain_or_world_orientation_l2 = RewTerm(
-        func=mdp.platform_terrain_or_world_orientation_l2,
+    flat_orientation_l2 = RewTerm(
+        func=mdp.flat_orientation_l2,
         weight=-8.0,
         params={
-            "sensor_cfg": SceneEntityCfg("body_scanner"),
-            "roughness_std": 0.015,
-            "discontinuity_height": 0.06,
-            "discontinuity_std": 0.015,
+            "exclude_terrain_type_start": D1_SLOPE_TERRAIN_START,
+        },
+    )
+    flat_wheel_thigh_alignment = RewTerm(
+        func=mdp.wheel_thigh_x_alignment,
+        weight=-0.5,
+        params={
+            "std": 0.05,
+            "thigh_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh"],
+                preserve_order=True,
+            ),
+            "wheel_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+            "exclude_terrain_type_start": D1_SLOPE_TERRAIN_START,
+            "upright_gate": True,
         },
     )
     wheel_scrub_penalty = RewTerm(
@@ -219,24 +220,21 @@ class PlatformRewardsCfg(RoughRewardsCfg):
         },
     )
     foot_clearance = RewTerm(
-        func=mdp.platform_foot_clearance,
-        weight=0.50,
+        func=mdp.foot_clearance,
+        weight=1.50,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
             "target_height": 0.04,
-            "yaw_target_height": 0.04,
             "std": 0.03,
-            "wheel_radius": 0.10,
+            "wheel_radius": 0.087,
             "command_threshold": 0.10,
             "max_air_time": 0.20,
-            "hover_penalty_scale": 1.0,
             "min_contact": 2,
             "lift_penalty_scale": 20.0,
-            "target_centered": True,
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-            "plane_residual_gate_std": 0.01,
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "exclude_terrain_type_start": D1_STAIRS_TERRAIN_START,
         },
     )
     zero_command_base_motion_l2 = RewTerm(
@@ -270,58 +268,26 @@ class PlatformRewardsCfg(RoughRewardsCfg):
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"]),
         },
     )
-    hip_default = RewTerm(
+
+    joint_default = RewTerm(
         func=mdp.default_joint_l2,
         weight=-1.0,
         params={
             "upright_gate": False,
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"]),
-        },
-    )
-    flat_yaw_hip_pos = RewTerm(
-        func=mdp.platform_flat_yaw_hip_pos_l2,
-        weight=-15.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"]),
-            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-            "command_name": "base_velocity",
-            "yaw_threshold": 0.10,
-            "tolerance": 0.25,
-            "terrain_slope_gate_std": 0.05,
-            "plane_residual_gate_std": 0.015,
-        },
-    )
-    flat_wheel_thigh_alignment = RewTerm(
-        func=mdp.platform_wheel_thigh_x_alignment,
-        weight=-0.5,
-        params={
-            "std": 0.05,
-            "thigh_cfg": SceneEntityCfg(
-                "robot",
-                body_names=["FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh"],
-                preserve_order=True,
-            ),
-            "wheel_cfg": SceneEntityCfg(
-                "robot",
-                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-                preserve_order=True,
-            ),
-            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-            "terrain_slope_gate_std": 0.05,
-            "plane_residual_gate_std": 0.015,
-            "upright_gate": True,
-        },
-    )
-    run_still = RewTerm(
-        func=mdp.platform_run_still,
-        weight=-0.15,
-        params={
-            "command_name": "base_velocity",
-            "command_threshold": 0.1,
-            "lateral_or_rot_threshold": 0.1,
-            "terrain_sensor_cfg": SceneEntityCfg("body_scanner"),
-            "plane_residual_gate_std": 0.03,
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*(hip|thigh|calf)_joint"]),
+        },
+    )
+
+    hip_pos = RewTerm(
+        func=mdp.hip_pos,
+        weight=-10.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"]),
+            "command_name": "base_velocity",
+            "command_threshold": 0.10,
+            "tolerance": 0.20,
+            "loose_ratio": 1.0,
+            "exclude_terrain_type_start": D1_PLATFORM_TERRAIN_START,
         },
     )
 
@@ -354,7 +320,7 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
     one bounded NP3O safety cost and is intended for a fresh training run.
     """
 
-    scene: PlatformSceneCfg = PlatformSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: SceneCfg = SceneCfg(num_envs=4096, env_spacing=2.5)
     commands: PlatformCommandsCfg = PlatformCommandsCfg()
     rewards: PlatformRewardsCfg = PlatformRewardsCfg()
     costs: PlatformCostsCfg = PlatformCostsCfg()
@@ -365,9 +331,9 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
 
         self.sim.physx.gpu_collision_stack_size = 2**27
 
-        # Reward-only terrain perception. This scanner is never appended to the
-        # policy observations, so the actor/deployment contract is unchanged.
-        self.scene.body_scanner.update_period = self.decimation * self.sim.dt
+        # The rough-task override disables this term; the platform task keeps it on flat terrain.
+        self.rewards.flat_orientation_l2.weight = -10.0
+
         # Keep a 10-sample (50 ms) contact window. The traversal state accepts
         # 8/10 valid samples while requiring the latest sample to be valid.
         self.scene.contact_forces.history_length = 10
@@ -384,35 +350,22 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
                 "move_up_distance_override": 3.0,
             },
         )
-        # Expand only the ordinary-terrain X range; platform ranges stay fixed.
-        self.curriculum.command_levels_lin_vel = CurrTerm(
-            func=mdp.command_levels_lin_vel_x,
-            params={
-                "reward_term_name": "track_lin_vel_xy_exp",
-                "max_curriculum": 1.5,
-                "increment": 0.5,
-            },
-        )
+        self.curriculum.command_levels_lin_vel = None
         self.curriculum.command_levels_ang_vel = None
 
         self.rewards.track_lin_vel_xy_exp.weight = 2.0
         self.rewards.track_ang_vel_z_exp.weight = 1.0
-        # The platform orientation term replaces a world-level term that opposes edge pitch.
-        self.rewards.flat_orientation_l2 = None
         # Do not let a temporary pitch erase tracking and contact feedback.
         for reward_name in (
             "track_lin_vel_xy_exp",
             "track_ang_vel_z_exp",
-            "lin_vel_z_l2",
             "ang_vel_xy_l2",
-            "base_height_l2",
             "action_rate_l2",
             "undesired_contacts",
             "feet_stumble",
         ):
             getattr(self.rewards, reward_name).params["upright_gate"] = False
         self.rewards.power_distribution_var = None
-        self.rewards.hip_pos = None
         self.rewards.joint_mirror = None
         self.rewards.gait_trot = None
         # Restore command-gated stepping terms changed by the rough base cfg.
@@ -456,6 +409,14 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
             "pitch": (0.0, 0.0),
             "yaw": (0.0, 0.0),
         })
+        self.events.reset_base.params["velocity_range"] = {
+            "x": (-0.05, 0.05),
+            "y": (-0.05, 0.05),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (-0.05, 0.05),
+        }
 
         if self.__class__.__name__ == "D1PlatformNP3OEnvCfg":
             self.disable_zero_weight_rewards()

@@ -26,17 +26,16 @@ def platform_terrain_type_masks(
     terrain_types: torch.Tensor,
     num_cols: int,
     platform_start: float,
-    descent_start: float | None = None,
+    descent_start: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Classify ordinary, platform-ascent, and platform-descent columns."""
-    platform_min = platform_terrain_type_start_index(platform_start, num_cols)
-    platform = terrain_types >= platform_min
-    if descent_start is None:
-        return platform, torch.zeros_like(platform)
-    if descent_start <= platform_start:
-        raise ValueError("descent_start must follow platform_start.")
+    """Return disjoint masks for platform-ascent and platform-descent columns."""
+    ascent_min = platform_terrain_type_start_index(platform_start, num_cols)
     descent_min = platform_terrain_type_start_index(descent_start, num_cols)
-    return platform, terrain_types >= descent_min
+    if not 0 <= ascent_min < descent_min < num_cols:
+        raise ValueError("Invalid platform terrain column boundaries.")
+    ascent = (terrain_types >= ascent_min) & (terrain_types < descent_min)
+    descent = terrain_types >= descent_min
+    return ascent, descent
 
 
 def platform_positive_reward_clip(
@@ -60,9 +59,9 @@ class PlatformTraversalSettings:
     top_horizontal_force_ratio: float = 2.0
     command_threshold: float = 0.05
     support_history_steps: int = 10
-    leading_ascent_speed: float = 0.60
-    trailing_ascent_speed: float = 0.60
-    ascent_slowdown_distance: float = 0.05
+    leading_ascent_speed: float = 1.00
+    trailing_ascent_speed: float = 1.00
+    ascent_slowdown_distance: float = 0.10
     ascent_min_speed: float = 0.20
     ascent_overshoot_margin: float = 0.04
     ascent_overshoot_ramp: float = 0.10
@@ -70,7 +69,7 @@ class PlatformTraversalSettings:
     leading_axle_sync_tolerance: float = 0.03
     leading_axle_sync_ramp: float = 0.07
     leading_descent_speed: float = 0.22
-    trailing_descent_speed: float = 0.45
+    trailing_descent_speed: float = 1.00
     speed_quadratic_blend: float = 0.5
     leading_ascent_contact_floor: float = 0.05
     trailing_ascent_contact_floor: float = 0.20
@@ -82,12 +81,16 @@ class PlatformTraversalSettings:
     min_support_count: int = 2
     vertical_speed_scale: float = 0.35
     max_leading_descent_speed: float = 0.30
-    max_trailing_descent_speed: float = 0.55
+    max_trailing_descent_speed: float = 1.30
+    max_leading_descent_pitch_rate: float = 0.60
     max_descent_ang_vel: float = 1.0
-    max_descent_tilt: float = math.radians(45.0)
+    max_descent_tilt: float = math.radians(35.0)
+    base_impact_force_threshold: float = 200.0
+    base_impact_force_ramp: float = 800.0
     trailing_descent_air_time_grace: float = 0.08
     trailing_descent_air_time_ramp: float = 0.15
-    min_trailing_descent_progress_speed: float = 0.25
+    min_trailing_descent_progress_speed: float = 0.80
+    trailing_descent_wall_cost_scale: float = 0.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -116,7 +119,10 @@ class PlatformTraversalSettings:
             "vertical_speed_scale",
             "max_leading_descent_speed",
             "max_trailing_descent_speed",
+            "max_leading_descent_pitch_rate",
             "max_descent_ang_vel",
+            "base_impact_force_threshold",
+            "base_impact_force_ramp",
             "trailing_descent_air_time_ramp",
             "min_trailing_descent_progress_speed",
         )
@@ -130,6 +136,7 @@ class PlatformTraversalSettings:
             "trailing_descent_phase_penalty",
             "air_time_grace",
             "trailing_descent_air_time_grace",
+            "trailing_descent_wall_cost_scale",
         )
         unit_interval = (
             "speed_quadratic_blend",
@@ -282,7 +289,8 @@ def _platform_phase_masks(
     sequence = edge_visible & ~leading_completed
     leading_descent = leading & leading_is_descent
     trailing_descent = trailing & trailing_is_descent
-    return sequence, leading, trailing, leading_descent, trailing_descent
+    trailing_wall = edge_visible & trailing_is_descent & ~trailing_on_target
+    return sequence, leading, trailing, leading_descent, trailing_descent, trailing_wall
 
 
 def _platform_wall_contact_scores(
@@ -312,20 +320,6 @@ def _platform_landing_force_penalty(
     forces_z = torch.clamp(net_forces_w_history[..., 2], min=0.0)
     peak_force_z = torch.amax(forces_z, dim=1)
     return torch.sum(torch.clamp(peak_force_z - threshold, min=0.0), dim=1)
-
-
-def _platform_mean_scan_height(
-    ray_hits_w: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return mean scan height and an all-rays-valid mask."""
-    valid = torch.isfinite(ray_hits_w).all(dim=(1, 2))
-    valid &= (torch.abs(ray_hits_w) < 1.0e6).all(dim=(1, 2))
-    safe_heights = torch.where(
-        valid[:, None],
-        ray_hits_w[..., 2],
-        torch.zeros_like(ray_hits_w[..., 2]),
-    )
-    return torch.mean(safe_heights, dim=1, keepdim=True), valid
 
 
 def _platform_descent_stall_cost(
@@ -381,11 +375,6 @@ def _platform_toward_target_progress(
     backslide_ratio = torch.clamp(-speed_ratio, min=0.0)
     toward_progress = (1.0 - speed_quadratic_blend) * toward_ratio + speed_quadratic_blend * torch.square(toward_ratio)
     ascent_overspeed = torch.clamp(raw_speed_ratio - 1.0, min=0.0, max=1.0)
-    toward_progress = torch.where(
-        direction > 0.0,
-        torch.clamp(toward_progress - torch.square(ascent_overspeed), min=0.0),
-        toward_progress,
-    )
     backslide_progress = (1.0 - speed_quadratic_blend) * backslide_ratio + speed_quadratic_blend * torch.square(
         backslide_ratio
     )
@@ -395,7 +384,11 @@ def _platform_toward_target_progress(
         ascent_gate,
         torch.ones_like(wall_score),
     )
-    return contact_gate * toward_progress - backslide_penalty_scale * backslide_progress
+    return (
+        contact_gate * toward_progress
+        - 2.0 * torch.square(ascent_overspeed) * (direction > 0.0).float()
+        - backslide_penalty_scale * backslide_progress
+    )
 
 
 def _platform_ascent_overshoot(

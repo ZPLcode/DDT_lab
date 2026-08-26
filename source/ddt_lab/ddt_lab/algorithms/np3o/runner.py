@@ -21,7 +21,38 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import rsl_rl
-from rsl_rl.utils import store_code_state
+
+try:
+    from rsl_rl.utils import store_code_state
+except ImportError:
+
+    def store_code_state(log_dir: str, repo_paths: list[str]) -> list[str]:
+        """Save repository state with rsl-rl versions that no longer export this helper."""
+        import git
+
+        git_log_dir = os.path.join(log_dir, "git")
+        os.makedirs(git_log_dir, exist_ok=True)
+        stored_files = []
+        for repo_path in repo_paths:
+            try:
+                repo = git.Repo(repo_path, search_parent_directories=True)
+            except (git.InvalidGitRepositoryError, git.NoSuchPathError):
+                continue
+
+            repo_name = os.path.basename(repo.working_tree_dir)
+            diff_path = os.path.join(git_log_dir, f"{repo_name}.diff")
+            if os.path.exists(diff_path):
+                continue
+
+            content = (
+                f"--- git commit ---\n{repo.head.commit.hexsha}\n\n\n"
+                f"--- git status ---\n{repo.git.status()}\n\n\n"
+                f"--- git diff ---\n{repo.git.diff(repo.head.commit.tree)}"
+            )
+            with open(diff_path, "x", encoding="utf-8") as stream:
+                stream.write(content)
+            stored_files.append(diff_path)
+        return stored_files
 
 from .actor_critic import ActorCriticBarlowTwins
 from .np3o import NP3O
@@ -208,6 +239,7 @@ class OnConstraintPolicyRunner:
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0 and self.log_dir is not None:
+                self.current_learning_iteration = it
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
             ep_infos.clear()
 
@@ -299,11 +331,13 @@ class OnConstraintPolicyRunner:
         _console_write(log_string)
 
     def save(self, path, infos=None):
+        env_step = getattr(self.env.unwrapped, "common_step_counter", None)
         torch.save(
             {
                 "model_state_dict": self.alg.actor_critic.state_dict(),
                 "optimizer_state_dict": self.alg.optimizer.state_dict(),
                 "iter": self.current_learning_iteration,
+                "env_common_step_counter": int(env_step) if env_step is not None else None,
                 "infos": infos,
             },
             path,
@@ -312,8 +346,25 @@ class OnConstraintPolicyRunner:
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
-        if load_optimizer:
+        if load_optimizer and "optimizer_state_dict" in loaded_dict:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+
+        saved_iter = int(loaded_dict.get("iter", 0))
+        checkpoint_name = os.path.basename(path)
+        if saved_iter == 0 and checkpoint_name.startswith("model_") and checkpoint_name.endswith(".pt"):
+            try:
+                saved_iter = int(checkpoint_name[len("model_") : -len(".pt")])
+            except ValueError:
+                pass
+        self.current_learning_iteration = saved_iter
+
+        env_step = loaded_dict.get("env_common_step_counter")
+        if env_step is None and saved_iter > 0:
+            env_step = saved_iter * self.num_steps_per_env
+        if env_step is not None and hasattr(self.env.unwrapped, "common_step_counter"):
+            self.env.unwrapped.common_step_counter = int(env_step)
+            self.env.reset()
+            _console_write(f"[INFO] Restored environment curriculum step: {int(env_step)}")
         return loaded_dict.get("infos")
 
     def get_inference_policy(self, device=None):

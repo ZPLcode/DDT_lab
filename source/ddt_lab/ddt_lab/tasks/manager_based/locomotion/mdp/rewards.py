@@ -733,6 +733,7 @@ def base_height_l2(
     target_height: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg | None = None,
+    exclude_terrain_type_start: float | None = None,
 ) -> torch.Tensor:
     """Penalize asset height from its target using L2 squared kernel.
 
@@ -756,6 +757,8 @@ def base_height_l2(
     # Compute the L2 squared penalty
     reward = torch.square(asset.data.root_pos_w[:, 2] - adjusted_target_height)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        reward = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, reward)
     return reward
 
 
@@ -763,6 +766,7 @@ def lin_vel_z_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     upright_gate: bool = True,
+    exclude_terrain_type_start: float | None = None,
 ) -> torch.Tensor:
     """Penalize z-axis base linear velocity using L2 squared kernel."""
     # extract the used quantities (to enable type-hinting)
@@ -770,6 +774,8 @@ def lin_vel_z_l2(
     reward = torch.square(asset.data.root_lin_vel_b[:, 2])
     if upright_gate:
         reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        reward = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, reward)
     return reward
 
 
@@ -806,7 +812,11 @@ def undesired_contacts(
     return reward
 
 
-def flat_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def flat_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    exclude_terrain_type_start: float | None = None,
+) -> torch.Tensor:
     """Penalize non-flat base orientation using L2 squared kernel.
 
     This is computed by penalizing the xy-components of the projected gravity vector.
@@ -815,7 +825,38 @@ def flat_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scen
     asset: RigidObject = env.scene[asset_cfg.name]
     reward = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        reward = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, reward)
     return reward
+
+
+def wheel_thigh_x_alignment(
+    env: ManagerBasedRLEnv,
+    std: float,
+    thigh_cfg: SceneEntityCfg,
+    wheel_cfg: SceneEntityCfg,
+    exclude_terrain_type_start: float | None = None,
+    upright_gate: bool = True,
+) -> torch.Tensor:
+    """Penalize fore-aft offsets between each wheel axle and its thigh joint."""
+    asset: Articulation = env.scene[thigh_cfg.name]
+    offset_w = (
+        asset.data.body_link_pos_w[:, wheel_cfg.body_ids]
+        - asset.data.body_link_pos_w[:, thigh_cfg.body_ids]
+    )
+    num_wheels = offset_w.shape[1]
+    root_quat_w = asset.data.root_link_quat_w[:, None].expand(-1, num_wheels, -1)
+    offset_b = quat_apply_inverse(
+        root_quat_w.reshape(-1, 4),
+        offset_w.reshape(-1, 3),
+    ).reshape(env.num_envs, num_wheels, 3)
+    penalty = torch.mean(torch.square(offset_b[:, :, 0] / std), dim=1)
+
+    if upright_gate:
+        penalty *= torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        penalty = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, penalty)
+    return penalty
 
 
 def default_joint_l2(
@@ -920,6 +961,7 @@ def foot_clearance(
     lift_penalty_scale: float = 1.0,
     terrain_sensor_cfg: SceneEntityCfg | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    exclude_terrain_type_start: float | None = None,
 ) -> torch.Tensor:
     """Reward foot-lift height during lin_y/ang_z, penalise it during lin_x-only/standing.
 
@@ -992,7 +1034,10 @@ def foot_clearance(
 
     reward = in_air.float() * torch.where(active, active_term, inactive_term)  # (B, K)
 
-    return reward.sum(dim=-1) * torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    reward = reward.sum(dim=-1) * torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        reward = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, reward)
+    return reward
 
 
 def wheel_roll_reward(
@@ -1108,6 +1153,7 @@ def hip_pos(
     command_threshold: float = 0.1,
     tolerance: float = 0.05,
     loose_ratio: float = 0.2,
+    exclude_terrain_type_start: float | None = None,
 ) -> torch.Tensor:
     """Hip constraint with two penalty levels based on command direction.
 
@@ -1131,6 +1177,8 @@ def hip_pos(
     excess = torch.clamp(hip_pos.abs() - tolerance, min=0.0)  # (B, K)
     reward = excess.pow(2).sum(dim=-1) * scale
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    if exclude_terrain_type_start is not None:
+        reward = torch.where(_terrain_type_mask(env, exclude_terrain_type_start), 0.0, reward)
     return reward
 
 

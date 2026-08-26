@@ -137,28 +137,6 @@ def command_levels_lin_vel(
     return torch.tensor(base_velocity_ranges.lin_vel_x[1], device=env.device)
 
 
-def command_levels_lin_vel_x(
-    env: ManagerBasedRLEnv,
-    env_ids: Sequence[int],
-    reward_term_name: str,
-    max_curriculum: float = 1.5,
-    increment: float = 0.5,
-) -> torch.Tensor:
-    """Expand only the commanded X-velocity range."""
-    base_velocity_ranges = env.command_manager.get_term("base_velocity").cfg.ranges
-    if env.common_step_counter % env.max_episode_length == 0:
-        episode_sums = env.reward_manager._episode_sums[reward_term_name]
-        reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
-        mean_tracking_reward = torch.mean(episode_sums[env_ids]) / env.max_episode_length_s
-        if mean_tracking_reward > 0.8 * reward_term_cfg.weight:
-            lower, upper = base_velocity_ranges.lin_vel_x
-            base_velocity_ranges.lin_vel_x = (
-                max(float(lower) - increment, -max_curriculum),
-                min(float(upper) + increment, max_curriculum),
-            )
-    return torch.tensor(base_velocity_ranges.lin_vel_x[1], device=env.device)
-
-
 def command_levels_ang_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

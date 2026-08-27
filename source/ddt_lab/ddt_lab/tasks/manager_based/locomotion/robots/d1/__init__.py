@@ -10,6 +10,7 @@ from .dreamwaq import agents as _dw_agents
 from .dreamwaq import flat_env_cfg as _dw_flat
 from .dreamwaq import rough_env_cfg as _dw_rough
 from .np3o import agents as _np3o_agents
+from .np3o import all_terrain_env_cfg as _np3o_all_terrain
 from .np3o import flat_env_cfg as _np3o_flat
 from .np3o import height_env_cfg as _np3o_height
 from .np3o import rough_env_cfg as _np3o_rough
@@ -104,6 +105,26 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": _np3o_height.D1HeightFlatNP3OEnvCfg_PLAY,
         "np3o_cfg_entry_point": f"{_np3o_agents.__name__}.np3o_cfg:d1_height_flat_np3o_runner_cfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-HeightAllTerrain-D1-NP3O-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": _np3o_all_terrain.D1HeightAllTerrainNP3OEnvCfg,
+        "np3o_cfg_entry_point": f"{_np3o_agents.__name__}.np3o_cfg:d1_height_all_terrain_np3o_runner_cfg",
+    },
+)
+
+gym.register(
+    id="DDT-Velocity-HeightAllTerrain-D1-NP3O-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": _np3o_all_terrain.D1HeightAllTerrainNP3OEnvCfg_PLAY,
+        "np3o_cfg_entry_point": f"{_np3o_agents.__name__}.np3o_cfg:d1_height_all_terrain_np3o_runner_cfg",
     },
 )
 

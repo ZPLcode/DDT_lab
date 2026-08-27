@@ -55,6 +55,113 @@ def terrain_levels_vel(
     return torch.mean(terrain.terrain_levels.float())
 
 
+def terrain_level_statistics(
+    env: RLTaskEnv,
+    env_ids: Sequence[int],
+    terrain_type_groups: dict[str, Sequence[str]],
+    statistic_names: Sequence[str] = ("mean", "median", "p90", "max"),
+) -> dict[str, torch.Tensor]:
+    """Report curriculum levels for selected generated-terrain groups."""
+    del env_ids
+    terrain: TerrainImporter = env.scene.terrain
+    terrain_generator = terrain.cfg.terrain_generator
+    if terrain_generator is None:
+        raise ValueError("Terrain-level statistics require a terrain generator.")
+
+    terrain_names = list(terrain_generator.sub_terrains)
+    proportions = [float(cfg.proportion) for cfg in terrain_generator.sub_terrains.values()]
+    proportion_sum = sum(proportions)
+    if proportion_sum <= 0.0:
+        raise ValueError("Terrain proportions must sum to a positive value.")
+
+    requested_statistics = tuple(statistic_names)
+    supported_statistics = {"mean", "median", "p90", "max"}
+    unknown_statistics = set(requested_statistics) - supported_statistics
+    if unknown_statistics:
+        raise ValueError(
+            f"Unknown terrain-level statistics: {sorted(unknown_statistics)}. "
+            f"Supported values: {sorted(supported_statistics)}."
+        )
+
+    cumulative_proportions: list[float] = []
+    cumulative = 0.0
+    for proportion in proportions:
+        cumulative += proportion / proportion_sum
+        cumulative_proportions.append(cumulative)
+
+    # TerrainGenerator assigns curriculum terrain types by normalized column.
+    column_terrain_names: list[str] = []
+    for column in range(terrain_generator.num_cols):
+        choice = column / terrain_generator.num_cols + 0.001
+        terrain_index = next(
+            (
+                index
+                for index, cumulative_proportion in enumerate(cumulative_proportions)
+                if choice < cumulative_proportion
+            ),
+            len(terrain_names) - 1,
+        )
+        column_terrain_names.append(terrain_names[terrain_index])
+
+    statistics: dict[str, torch.Tensor] = {}
+    available_names = set(terrain_names)
+    for group_name, requested_names in terrain_type_groups.items():
+        requested_names = tuple(requested_names)
+        unknown_names = set(requested_names) - available_names
+        if unknown_names:
+            raise ValueError(
+                f"Unknown terrain types for group '{group_name}': {sorted(unknown_names)}. "
+                f"Available types: {terrain_names}."
+            )
+
+        columns = [
+            column for column, terrain_name in enumerate(column_terrain_names) if terrain_name in requested_names
+        ]
+        if columns:
+            column_ids = torch.tensor(columns, device=terrain.terrain_types.device)
+            levels = terrain.terrain_levels[torch.isin(terrain.terrain_types, column_ids)].float()
+        else:
+            levels = torch.empty(0, device=terrain.terrain_levels.device)
+
+        if levels.numel() == 0:
+            missing = torch.tensor(float("nan"), device=terrain.terrain_levels.device)
+            for statistic_name in requested_statistics:
+                statistics[f"{group_name}/{statistic_name}"] = missing
+            continue
+
+        if "mean" in requested_statistics:
+            statistics[f"{group_name}/mean"] = levels.mean()
+        if "median" in requested_statistics:
+            statistics[f"{group_name}/median"] = levels.median()
+        if "p90" in requested_statistics:
+            statistics[f"{group_name}/p90"] = torch.quantile(levels, 0.90)
+        if "max" in requested_statistics:
+            statistics[f"{group_name}/max"] = levels.max()
+
+    return statistics
+
+
+def base_height_command_curriculum(
+    env: RLTaskEnv,
+    env_ids: Sequence[int],
+    command_name: str = "base_height",
+    start_floor: float = 0.35,
+    end_floor: float = 0.15,
+    full_steps: int = 144000,
+) -> torch.Tensor:
+    """Linearly lower the sampled base-height floor during early training."""
+    del env_ids
+    if full_steps <= 0:
+        raise ValueError("full_steps must be positive.")
+
+    progress = min(1.0, env.common_step_counter / float(full_steps))
+    floor = start_floor + (end_floor - start_floor) * progress
+    term = env.command_manager.get_term(command_name)
+    ceiling = float(term.cfg.ranges.height[1])
+    term.cfg.ranges.height = (float(floor), ceiling)
+    return torch.tensor(floor, device=env.device)
+
+
 def command_levels_lin_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

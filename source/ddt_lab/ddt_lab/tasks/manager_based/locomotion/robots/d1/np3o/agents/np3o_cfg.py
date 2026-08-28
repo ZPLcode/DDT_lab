@@ -33,10 +33,9 @@ def d1_flat_np3o_runner_cfg() -> dict:
 
 
 def d1_platform_np3o_runner_cfg() -> dict:
-    """D1 flat-ground NP3O config — matches ``D1FlatCfgPPO``."""
+    """D1 high-platform ascent/descent NP3O config."""
     cfg = d1_rough_np3o_runner_cfg()
     cfg["runner"]["experiment_name"] = "d1_platform"
-    cfg["runner"]["max_iterations"] = 20000
     cfg["algorithm"]["use_symmetry"] = True
     cfg["algorithm"]["use_fa_symmetry"] = False
     cfg["algorithm"]["mirror_coef"] = 0.5

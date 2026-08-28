@@ -14,36 +14,12 @@ import torch
 
 
 def platform_terrain_type_start_index(fraction: float, num_cols: int) -> int:
-    """Map a terrain fraction to Isaac Lab's first curriculum column."""
+    """Map a terrain proportion to its first curriculum column."""
     if not 0.0 <= fraction < 1.0:
         raise ValueError("fraction must be in [0, 1).")
     if num_cols <= 0:
         raise ValueError("num_cols must be positive.")
-    return max(0, math.ceil((fraction - 0.001) * num_cols))
-
-
-def platform_terrain_type_masks(
-    terrain_types: torch.Tensor,
-    num_cols: int,
-    platform_start: float,
-    descent_start: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return disjoint masks for platform-ascent and platform-descent columns."""
-    ascent_min = platform_terrain_type_start_index(platform_start, num_cols)
-    descent_min = platform_terrain_type_start_index(descent_start, num_cols)
-    if not 0 <= ascent_min < descent_min < num_cols:
-        raise ValueError("Invalid platform terrain column boundaries.")
-    ascent = (terrain_types >= ascent_min) & (terrain_types < descent_min)
-    descent = terrain_types >= descent_min
-    return ascent, descent
-
-
-def platform_positive_reward_clip(
-    total_reward: torch.Tensor,
-    termination_reward: torch.Tensor,
-) -> torch.Tensor:
-    """Clip ordinary reward to zero before restoring the termination term."""
-    return torch.clamp(total_reward - termination_reward, min=0.0) + termination_reward
+    return math.ceil((fraction - 0.001) * num_cols)
 
 
 @dataclass
@@ -72,7 +48,8 @@ class PlatformTraversalSettings:
     trailing_descent_speed: float = 1.00
     speed_quadratic_blend: float = 0.5
     leading_ascent_contact_floor: float = 0.05
-    trailing_ascent_contact_floor: float = 0.20
+    # Keep rear-axle ascent progress independent of wall-normal contact.
+    trailing_ascent_contact_floor: float = 1.00
     backslide_penalty_scale: float = 0.50
     trailing_descent_wall_penalty_scale: float = 0.35
     trailing_descent_phase_penalty: float = 0.12
@@ -89,7 +66,7 @@ class PlatformTraversalSettings:
     base_impact_force_ramp: float = 800.0
     trailing_descent_air_time_grace: float = 0.08
     trailing_descent_air_time_ramp: float = 0.15
-    min_trailing_descent_progress_speed: float = 0.80
+    min_trailing_descent_progress_speed: float = 0.90
     trailing_descent_wall_cost_scale: float = 0.0
 
     def __post_init__(self) -> None:
@@ -98,60 +75,41 @@ class PlatformTraversalSettings:
     def validate(self) -> None:
         """Reject settings that would invert gates or divide by zero."""
         positive = (
-            "wheel_radius",
-            "min_step_height",
-            "surface_tolerance",
-            "support_force_threshold",
-            "wall_force_threshold",
-            "top_horizontal_force_ratio",
-            "support_history_steps",
-            "leading_ascent_speed",
-            "trailing_ascent_speed",
-            "ascent_slowdown_distance",
-            "ascent_min_speed",
+            "wheel_radius", "min_step_height", "surface_tolerance",
+            "support_force_threshold", "wall_force_threshold", "top_horizontal_force_ratio",
+            "support_history_steps", "leading_ascent_speed", "trailing_ascent_speed",
+            "ascent_slowdown_distance", "ascent_min_speed",
             "ascent_overshoot_ramp",
-            "leading_axle_sync_tolerance",
-            "leading_axle_sync_ramp",
-            "leading_descent_speed",
-            "trailing_descent_speed",
-            "air_time_ramp",
-            "min_support_count",
-            "vertical_speed_scale",
-            "max_leading_descent_speed",
-            "max_trailing_descent_speed",
-            "max_leading_descent_pitch_rate",
-            "max_descent_ang_vel",
-            "base_impact_force_threshold",
-            "base_impact_force_ramp",
-            "trailing_descent_air_time_ramp",
-            "min_trailing_descent_progress_speed",
+            "leading_axle_sync_tolerance", "leading_axle_sync_ramp",
+            "leading_descent_speed", "trailing_descent_speed", "air_time_ramp",
+            "min_support_count", "vertical_speed_scale", "max_leading_descent_speed",
+            "max_trailing_descent_speed", "max_leading_descent_pitch_rate",
+            "max_descent_ang_vel", "base_impact_force_threshold", "base_impact_force_ramp",
+            "trailing_descent_air_time_ramp", "min_trailing_descent_progress_speed",
         )
         nonnegative = (
-            "probe_forward",
-            "command_threshold",
-            "backslide_penalty_scale",
-            "ascent_overshoot_margin",
-            "ascent_overshoot_penalty_scale",
-            "trailing_descent_wall_penalty_scale",
-            "trailing_descent_phase_penalty",
-            "air_time_grace",
-            "trailing_descent_air_time_grace",
+            "probe_forward", "command_threshold", "backslide_penalty_scale",
+            "ascent_overshoot_margin", "ascent_overshoot_penalty_scale",
+            "trailing_descent_wall_penalty_scale", "trailing_descent_phase_penalty",
+            "air_time_grace", "trailing_descent_air_time_grace",
             "trailing_descent_wall_cost_scale",
         )
         unit_interval = (
-            "speed_quadratic_blend",
-            "leading_ascent_contact_floor",
+            "speed_quadratic_blend", "leading_ascent_contact_floor",
             "trailing_ascent_contact_floor",
         )
         if (
             any(getattr(self, name) <= 0.0 for name in positive)
             or any(getattr(self, name) < 0.0 for name in nonnegative)
             or any(not 0.0 <= getattr(self, name) <= 1.0 for name in unit_interval)
-            or self.ascent_min_speed > min(self.leading_ascent_speed, self.trailing_ascent_speed)
+            or self.ascent_min_speed > min(
+                self.leading_ascent_speed, self.trailing_ascent_speed
+            )
+            or self.min_trailing_descent_progress_speed > self.trailing_descent_speed
+            or self.trailing_descent_speed > self.max_trailing_descent_speed
             or not 0.0 < self.max_descent_tilt < math.pi / 2
         ):
             raise ValueError("Invalid platform traversal settings.")
-
 
 def _platform_sample_heights(
     ray_hits_w: torch.Tensor,
@@ -220,7 +178,7 @@ def _platform_axle_on_destination(
     wheel_radius: float,
     tolerance: float,
 ) -> torch.Tensor:
-    """Require stable support on the leading axle's destination surface."""
+    """Require stable tread support on the leading axle's destination level."""
     if tolerance <= 0.0:
         raise ValueError("tolerance must be positive.")
     supported = (
@@ -253,7 +211,9 @@ def _platform_resolve_trailing_state(
         torch.sign(-height_delta),
         torch.zeros_like(height_delta),
     )
-    can_infer_after_crossing = scan_spans_transition & (~leading_transition_detected | ~leading_is_descent)
+    can_infer_after_crossing = scan_spans_transition & (
+        ~leading_transition_detected | ~leading_is_descent
+    )
     direction = torch.where(
         local_transition_detected[:, None],
         local_direction,
@@ -270,7 +230,9 @@ def _platform_resolve_trailing_state(
         | (scan_spans_transition & leading_is_descent)
         | (scan_spans_transition & airborne_above_target)
     )
-    exposed_wall = (target_surface_error < surface_tolerance) & (height_delta > surface_tolerance)
+    exposed_wall = (target_surface_error < surface_tolerance) & (
+        height_delta > surface_tolerance
+    )
     return direction, is_descent, exposed_wall
 
 
@@ -310,18 +272,6 @@ def _platform_wall_contact_scores(
     return opposing_travel, along_travel
 
 
-def _platform_landing_force_penalty(
-    net_forces_w_history: torch.Tensor,
-    threshold: float,
-) -> torch.Tensor:
-    """Sum peak upward contact force above a threshold."""
-    if threshold < 0.0:
-        raise ValueError("threshold must be non-negative.")
-    forces_z = torch.clamp(net_forces_w_history[..., 2], min=0.0)
-    peak_force_z = torch.amax(forces_z, dim=1)
-    return torch.sum(torch.clamp(peak_force_z - threshold, min=0.0), dim=1)
-
-
 def _platform_descent_stall_cost(
     air_time: torch.Tensor,
     vertical_velocity: torch.Tensor,
@@ -341,71 +291,3 @@ def _platform_descent_stall_cost(
         1.0,
     )
     return torch.mean(air_gate * stall_ratio, dim=-1)
-
-
-def _platform_toward_target_progress(
-    vertical_velocity: torch.Tensor,
-    direction: torch.Tensor,
-    height_delta: torch.Tensor,
-    wall_score: torch.Tensor,
-    ascent_speed: float,
-    descent_speed: float,
-    ascent_slowdown_distance: float,
-    ascent_min_speed: float,
-    speed_quadratic_blend: float,
-    ascent_contact_floor: float,
-    backslide_penalty_scale: float,
-) -> torch.Tensor:
-    """Return signed per-wheel progress toward the selected surface."""
-    remaining_distance = torch.clamp(-direction * height_delta, min=0.0)
-    ascent_distance_ratio = torch.clamp(
-        remaining_distance / ascent_slowdown_distance,
-        min=0.0,
-        max=1.0,
-    )
-    ascent_speed_limit = ascent_min_speed + (ascent_speed - ascent_min_speed) * ascent_distance_ratio
-    speed_limit = torch.where(
-        direction > 0.0,
-        ascent_speed_limit,
-        torch.full_like(direction, descent_speed),
-    )
-    raw_speed_ratio = direction * vertical_velocity / speed_limit
-    speed_ratio = torch.clamp(raw_speed_ratio, min=-1.0, max=1.0)
-    toward_ratio = torch.clamp(speed_ratio, min=0.0)
-    backslide_ratio = torch.clamp(-speed_ratio, min=0.0)
-    toward_progress = (1.0 - speed_quadratic_blend) * toward_ratio + speed_quadratic_blend * torch.square(toward_ratio)
-    ascent_overspeed = torch.clamp(raw_speed_ratio - 1.0, min=0.0, max=1.0)
-    backslide_progress = (1.0 - speed_quadratic_blend) * backslide_ratio + speed_quadratic_blend * torch.square(
-        backslide_ratio
-    )
-    ascent_gate = ascent_contact_floor + (1.0 - ascent_contact_floor) * wall_score
-    contact_gate = torch.where(
-        direction > 0.0,
-        ascent_gate,
-        torch.ones_like(wall_score),
-    )
-    return (
-        contact_gate * toward_progress
-        - 2.0 * torch.square(ascent_overspeed) * (direction > 0.0).float()
-        - backslide_penalty_scale * backslide_progress
-    )
-
-
-def _platform_ascent_overshoot(
-    height_delta: torch.Tensor,
-    ascent_mask: torch.Tensor,
-    margin: float,
-    ramp: float,
-) -> torch.Tensor:
-    """Return mean axle over-height while moving upward."""
-    overshoot = torch.square(torch.clamp((height_delta - margin) / ramp, min=0.0, max=1.0))
-    return torch.mean(overshoot * ascent_mask.float(), dim=1)
-
-
-def _squared_excess(
-    value: torch.Tensor,
-    threshold: float,
-    scale: float,
-) -> torch.Tensor:
-    """Return a squared, unit-clamped excess above a threshold."""
-    return torch.square(torch.clamp((value - threshold) / scale, min=0.0, max=1.0))

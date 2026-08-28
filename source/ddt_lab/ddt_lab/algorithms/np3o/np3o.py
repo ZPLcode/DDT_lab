@@ -50,10 +50,6 @@ class NP3O:
         mirror_coef=1.0,
         **kwargs,
     ):
-        if use_fa_symmetry and not use_symmetry:
-            raise ValueError("use_fa_symmetry requires use_symmetry")
-        if mirror_coef < 0.0:
-            raise ValueError("mirror_coef must be non-negative")
         self.device = device
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -90,21 +86,14 @@ class NP3O:
         self.mirror_coef = mirror_coef
         self._mirrors = []
 
-    def _mirror_loss(self, obs_batch):
+    def _mirror_loss(self, obs_batch, mean_batch):
+        """Enforce equivariance of the deterministic policy mean."""
         loss = torch.zeros((), device=obs_batch.device)
-        backbone = self.actor_critic.actor_teacher_backbone
-        training_states = [(module, module.training) for module in backbone.modules()]
-        backbone.eval()
-        try:
-            reference_mean = self.actor_critic.act_inference(obs_batch)
-            for obs_perm, obs_sign, act_perm, act_sign in self._mirrors:
-                mirrored_obs = obs_batch[:, :, obs_perm] * obs_sign
-                mirrored_mean = self.actor_critic.act_inference(mirrored_obs)
-                target_mean = (reference_mean[:, act_perm] * act_sign).detach()
-                loss = loss + torch.mean(torch.square(mirrored_mean - target_mean))
-        finally:
-            for module, training in training_states:
-                module.training = training
+        for obs_perm, obs_sign, act_perm, act_sign in self._mirrors:
+            mirrored_obs = obs_batch[:, :, obs_perm] * obs_sign
+            mirrored_mean = self.actor_critic.act_inference(mirrored_obs)
+            target_mean = (mean_batch[:, act_perm] * act_sign).detach()
+            loss = loss + torch.mean(torch.square(mirrored_mean - target_mean))
         return loss
 
     def init_storage(
@@ -122,7 +111,7 @@ class NP3O:
             if obs_dim not in (57, 58) or action_shape[-1] != 16:
                 raise ValueError(
                     "D1 symmetry requires 57 or 58 policy features and 16 actions; "
-                    f"received actor_obs_shape={actor_obs_shape}, action_shape={action_shape}"
+                    f"received actor_obs_shape={actor_obs_shape}, action_shape={action_shape}."
                 )
             self._mirrors = [build_d1_mirror(self.device, obs_dim)]
             if self.use_fa_symmetry:
@@ -328,11 +317,26 @@ class NP3O:
                 loss = main_loss + combine_value_loss + entropy_loss
 
             if self.use_symmetry:
-                loss = loss + self.mirror_coef * self._mirror_loss(obs_batch)
+                loss = loss + self.mirror_coef * self._mirror_loss(obs_batch, mu_batch)
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "NP3O loss became non-finite before optimizer.step(). "
+                    f"obs_finite={torch.isfinite(obs_batch).all().item()}, "
+                    f"critic_obs_finite={torch.isfinite(critic_obs_batch).all().item()}, "
+                    f"advantages_finite={torch.isfinite(advantages_batch).all().item()}, "
+                    f"returns_finite={torch.isfinite(returns_batch).all().item()}, "
+                    f"cost_advantages_finite={torch.isfinite(cost_advantages_batch).all().item()}, "
+                    f"cost_returns_finite={torch.isfinite(cost_returns_batch).all().item()}."
+                )
 
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(
+                self.actor_critic.parameters(),
+                self.max_grad_norm,
+                error_if_nonfinite=True,
+            )
             self.optimizer.step()
 
             mean_value_loss += value_loss.item()

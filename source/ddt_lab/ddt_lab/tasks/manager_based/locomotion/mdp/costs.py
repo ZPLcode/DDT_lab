@@ -43,9 +43,17 @@ def joint_torque_limit(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     soft_ratio: float = 0.9,
+    safe_limit: float | None = None,
 ) -> torch.Tensor:
-    """Sum of |τ| above the soft torque limit (``ratio * effort_limit``)."""
+    """Penalize torque above a soft or explicitly supplied safe limit."""
     asset: Articulation = env.scene[asset_cfg.name]
+    if safe_limit is not None:
+        torque = asset.data.computed_torque[:, asset_cfg.joint_ids]
+        hard_limit = asset.data.joint_effort_limits[:, asset_cfg.joint_ids]
+        soft_limit = torch.minimum(hard_limit * soft_ratio, torch.full_like(hard_limit, safe_limit))
+        excess = (torque.abs() - soft_limit) / (hard_limit - soft_limit).clamp(min=1.0e-6)
+        return torch.sum(excess.clamp(min=0.0).square(), dim=1)
+
     tau = asset.data.applied_torque[:, asset_cfg.joint_ids]
     limit = asset.data.joint_effort_limits[:, asset_cfg.joint_ids] * soft_ratio
     return torch.sum((tau.abs() - limit).clamp(min=0.0), dim=1)

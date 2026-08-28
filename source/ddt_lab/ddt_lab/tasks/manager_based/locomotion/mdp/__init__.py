@@ -19,8 +19,5 @@ from .platform_rewards import (  # noqa: F401
     platform_safety_cost,
     platform_traversal_reward,
 )
-from .platform_utils import (  # noqa: F401
-    PlatformTraversalSettings,
-    platform_positive_reward_clip,
-)
+from .platform_utils import PlatformTraversalSettings  # noqa: F401
 from .rewards import *  # noqa: F401, F403

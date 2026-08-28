@@ -31,7 +31,7 @@ def terrain_levels_vel(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     move_up_terrain_type_start: float | None = None,
     move_up_distance_override: float | None = None,
-) -> dict[str, torch.Tensor]:
+) -> torch.Tensor:
     """Curriculum based on the distance the robot walked when commanded to move at a desired velocity.
 
     This term is used to increase the difficulty of the terrain when the robot walks far enough and decrease the
@@ -41,9 +41,7 @@ def terrain_levels_vel(
         It is only possible to use this term with the terrain type ``generator``. For further information
         on different terrain types, check the :class:`isaaclab.terrains.TerrainImporter` class.
 
-    Returns:
-        Mapping with the overall mean terrain level (key ``"mean"``) plus the mean terrain level among
-        envs currently assigned to each sub-terrain type (key = sub-terrain name, e.g. ``"pits"``).
+    Platform descent columns may use a shorter promotion distance.
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
@@ -77,21 +75,84 @@ def terrain_levels_vel(
     # update terrain levels
     terrain.update_env_origins(env_ids, move_up, move_down)
 
-    # overall mean terrain level, plus a breakdown per sub-terrain type
-    levels = {"mean": torch.mean(terrain.terrain_levels.float())}
-    terrain_gen_cfg = terrain.cfg.terrain_generator
-    if terrain_gen_cfg is not None and terrain_gen_cfg.sub_terrains:
-        proportions = torch.tensor(
-            [sub_cfg.proportion for sub_cfg in terrain_gen_cfg.sub_terrains.values()], device=env.device
-        )
-        cumsum_props = torch.cumsum(proportions / proportions.sum(), dim=0)
-        for idx, name in enumerate(terrain_gen_cfg.sub_terrains):
-            col_start = round((0.0 if idx == 0 else cumsum_props[idx - 1].item()) * terrain_gen_cfg.num_cols)
-            col_end = round(cumsum_props[idx].item() * terrain_gen_cfg.num_cols)
-            mask = (terrain.terrain_types >= col_start) & (terrain.terrain_types < col_end)
-            if mask.any():
-                levels[name] = terrain.terrain_levels[mask].float().mean()
-    return levels
+    return torch.mean(terrain.terrain_levels.float())
+
+
+def terrain_level_statistics(
+    env: RLTaskEnv,
+    env_ids: Sequence[int],
+    terrain_type_groups: dict[str, Sequence[str]],
+    statistic_names: Sequence[str] = ("mean", "median", "p90", "max"),
+    include_level_fractions: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Report curriculum levels for selected terrain groups."""
+    del env_ids
+    terrain: TerrainImporter = env.scene.terrain
+    generator = terrain.cfg.terrain_generator
+    if generator is None:
+        raise ValueError("terrain statistics require a terrain generator.")
+
+    supported = {"mean", "median", "p90", "max"}
+    statistic_names = tuple(statistic_names)
+    unknown = set(statistic_names) - supported
+    if unknown:
+        raise ValueError(f"unsupported terrain statistics: {sorted(unknown)}")
+
+    names = list(generator.sub_terrains)
+    proportions = [float(cfg.proportion) for cfg in generator.sub_terrains.values()]
+    total = sum(proportions)
+    if total <= 0.0:
+        raise ValueError("terrain proportions must sum to a positive value.")
+
+    cumulative = []
+    running = 0.0
+    for proportion in proportions:
+        running += proportion / total
+        cumulative.append(running)
+
+    column_names = []
+    for column in range(generator.num_cols):
+        choice = column / generator.num_cols + 0.001
+        index = next((i for i, boundary in enumerate(cumulative) if choice < boundary), len(names) - 1)
+        column_names.append(names[index])
+
+    result: dict[str, torch.Tensor] = {}
+    available = set(names)
+    for group, requested in terrain_type_groups.items():
+        requested = tuple(requested)
+        unknown = set(requested) - available
+        if unknown:
+            raise ValueError(f"unknown terrain types for {group!r}: {sorted(unknown)}")
+
+        columns = [i for i, name in enumerate(column_names) if name in requested]
+        if columns:
+            column_ids = torch.tensor(columns, device=terrain.terrain_types.device)
+            levels = terrain.terrain_levels[torch.isin(terrain.terrain_types, column_ids)].float()
+        else:
+            levels = torch.empty(0, device=terrain.terrain_levels.device)
+
+        if levels.numel() == 0:
+            nan = torch.tensor(float("nan"), device=terrain.terrain_levels.device)
+            for statistic in statistic_names:
+                result[f"{group}/{statistic}"] = nan
+            if include_level_fractions:
+                for level in range(terrain.max_terrain_level):
+                    result[f"{group}/level_{level:02d}_fraction"] = nan
+            continue
+
+        if "mean" in statistic_names:
+            result[f"{group}/mean"] = levels.mean()
+        if "median" in statistic_names:
+            result[f"{group}/median"] = levels.median()
+        if "p90" in statistic_names:
+            result[f"{group}/p90"] = torch.quantile(levels, 0.90)
+        if "max" in statistic_names:
+            result[f"{group}/max"] = levels.max()
+        if include_level_fractions:
+            for level in range(terrain.max_terrain_level):
+                result[f"{group}/level_{level:02d}_fraction"] = (levels == level).float().mean()
+
+    return result
 
 
 def command_levels_lin_vel(

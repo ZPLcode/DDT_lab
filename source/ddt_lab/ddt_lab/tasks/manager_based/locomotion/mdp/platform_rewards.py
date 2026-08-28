@@ -18,18 +18,14 @@ from isaaclab.utils.math import quat_apply, yaw_quat
 
 from .platform_utils import (
     PlatformTraversalSettings,
-    _platform_ascent_overshoot,
     _platform_axle_on_destination,
     _platform_descent_stall_cost,
-    _platform_landing_force_penalty,
     _platform_phase_masks,
     _platform_resolve_trailing_state,
     _platform_sample_heights,
     _platform_step_direction,
-    _platform_toward_target_progress,
     _platform_travel_order,
     _platform_wall_contact_scores,
-    _squared_excess,
 )
 from .rewards import _terrain_type_mask, feet_stumble
 
@@ -58,11 +54,42 @@ def platform_landing_force_penalty(
     threshold: float,
 ) -> torch.Tensor:
     """Penalize only excessive upward wheel force, leaving wall-normal force free."""
+    if threshold < 0.0:
+        raise ValueError("threshold must be non-negative.")
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    return _platform_landing_force_penalty(
-        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids],
-        threshold,
+    forces_z = torch.clamp(
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, 2], min=0.0
     )
+    peak_force_z = torch.amax(forces_z, dim=1)
+    return torch.sum(torch.clamp(peak_force_z - threshold, min=0.0), dim=1)
+
+
+def _platform_update_trailing_unsupported_time(
+    env: ManagerBasedRLEnv,
+    unsupported: torch.Tensor,
+    just_reset: torch.Tensor,
+) -> torch.Tensor:
+    """Track time without horizontal-tread support, updating once per env step."""
+    timer = getattr(env, "_platform_trailing_unsupported_time", None)
+    last_step = getattr(env, "_platform_trailing_unsupported_last_step", None)
+    if timer is None or last_step is None:
+        timer = torch.zeros_like(unsupported, dtype=torch.float)
+        last_step = torch.full_like(env.episode_length_buf, -1)
+
+    current_step = env.episode_length_buf
+    advance = current_step != last_step
+    advanced_timer = torch.where(
+        unsupported,
+        timer + float(env.step_dt),
+        torch.zeros_like(timer),
+    )
+    timer = torch.where(advance[:, None], advanced_timer, timer)
+    timer = torch.where(just_reset[:, None], torch.zeros_like(timer), timer)
+    last_step = torch.where(advance | just_reset, current_step, last_step)
+
+    env._platform_trailing_unsupported_time = timer
+    env._platform_trailing_unsupported_last_step = last_step
+    return timer
 
 
 def _platform_contact_sequence_state(
@@ -90,22 +117,28 @@ def _platform_contact_sequence_state(
     motion_active = torch.abs(command_x) > settings.command_threshold
     commanded_forward = command_x >= 0.0
     just_reset = env.episode_length_buf <= 1
-
-    descent_travel_sign = getattr(env, "_platform_trailing_descent_travel_sign", None)
-    if descent_travel_sign is None:
-        descent_travel_sign = torch.zeros_like(command_x)
-    descent_travel_sign = torch.where(just_reset, torch.zeros_like(descent_travel_sign), descent_travel_sign)
-    descent_latch = descent_travel_sign != 0.0
-    forward_travel = torch.where(descent_latch, descent_travel_sign > 0.0, commanded_forward)
+    descent_latch = getattr(env, "_platform_trailing_descent_latch", None)
+    descent_forward = getattr(env, "_platform_trailing_descent_forward", None)
+    if descent_latch is None or descent_forward is None:
+        descent_latch = torch.zeros_like(motion_active)
+        descent_forward = commanded_forward.clone()
+    descent_latch = descent_latch & ~just_reset
+    forward_travel = torch.where(descent_latch, descent_forward, commanded_forward)
 
     leading_pos_w, trailing_pos_w = _platform_travel_order(wheel_pos_w, forward_travel)
     leading_vel_z, trailing_vel_z = _platform_travel_order(wheel_vel_z, forward_travel)
     leading_forces, trailing_forces = _platform_travel_order(wheel_forces, forward_travel)
     _, trailing_air_time = _platform_travel_order(wheel_air_time, forward_travel)
 
+    travel_active = motion_active | descent_latch
+    travel_direction = torch.where(
+        forward_travel,
+        torch.ones_like(command_x),
+        -torch.ones_like(command_x),
+    )
     travel_sign = torch.where(
-        motion_active | descent_latch,
-        torch.where(forward_travel, torch.ones_like(command_x), -torch.ones_like(command_x)),
+        travel_active,
+        travel_direction,
         torch.zeros_like(command_x),
     )
     forward_b = torch.zeros(env.num_envs, 3, device=env.device)
@@ -122,7 +155,9 @@ def _platform_contact_sequence_state(
         terrain_sensor.data.ray_hits_w,
         query_xy,
     )
-    leading_next_surface_z, trailing_surface_z, trailing_next_surface_z = torch.chunk(query_heights, 3, dim=1)
+    leading_next_surface_z, trailing_surface_z, trailing_next_surface_z = torch.chunk(
+        query_heights, 3, dim=1
+    )
     scan_spans_transition = scan_valid & (scan_height_span > settings.min_step_height)
 
     (
@@ -144,21 +179,33 @@ def _platform_contact_sequence_state(
     force_history = wheel_force_history[:, :history_steps]
     history_fz = torch.clamp(force_history[..., 2], min=0.0)
     history_fxy = torch.linalg.norm(force_history[..., :2], dim=-1)
-    support_history = (history_fz > settings.support_force_threshold) & (
-        history_fxy < settings.top_horizontal_force_ratio * history_fz
+    support_history = (
+        (history_fz > settings.support_force_threshold)
+        & (history_fxy < settings.top_horizontal_force_ratio * history_fz)
     )
     required_history_steps = math.ceil(0.8 * history_steps)
-    stable_support = support_history[:, 0] & (torch.sum(support_history, dim=1) >= required_history_steps)
-    leading_stable_support, trailing_stable_support = _platform_travel_order(stable_support, forward_travel)
+    stable_support = support_history[:, 0] & (
+        torch.sum(support_history, dim=1) >= required_history_steps
+    )
+    leading_stable_support, trailing_stable_support = _platform_travel_order(
+        stable_support, forward_travel
+    )
 
-    leading_height_delta = leading_pos_w[..., 2] - (leading_next_surface_z + settings.wheel_radius)
+    leading_height_delta = leading_pos_w[..., 2] - (
+        leading_next_surface_z + settings.wheel_radius
+    )
     leading_on_target = scan_spans_transition & torch.all(
-        (torch.abs(leading_height_delta) < settings.surface_tolerance) & leading_stable_support,
+        (torch.abs(leading_height_delta) < settings.surface_tolerance)
+        & leading_stable_support,
         dim=1,
     )
 
-    trailing_height_delta = trailing_pos_w[..., 2] - (trailing_next_surface_z + settings.wheel_radius)
-    trailing_target_surface_error = torch.abs(trailing_surface_z - trailing_next_surface_z)
+    trailing_height_delta = trailing_pos_w[..., 2] - (
+        trailing_next_surface_z + settings.wheel_radius
+    )
+    trailing_target_surface_error = torch.abs(
+        trailing_surface_z - trailing_next_surface_z
+    )
     trailing_on_target = _platform_axle_on_destination(
         trailing_pos_w[..., 2],
         trailing_surface_z,
@@ -169,6 +216,7 @@ def _platform_contact_sequence_state(
         settings.surface_tolerance,
     )
 
+    # Stable leading support confirms the handoff; only descent remains latched.
     leading_completed = leading_on_target
     (
         trailing_direction,
@@ -187,23 +235,23 @@ def _platform_contact_sequence_state(
     )
 
     platform_column = _terrain_type_mask(env, terrain_type_start)
-    descent_handoff = (
+    confirmed_descent_handoff = (
         platform_column
         & motion_active
         & leading_is_descent
         & leading_on_target
         & ~trailing_on_target
     )
-    handoff_travel_sign = torch.where(commanded_forward, torch.ones_like(command_x), -torch.ones_like(command_x))
-    descent_travel_sign = torch.where(descent_handoff, handoff_travel_sign, descent_travel_sign)
-    descent_travel_sign = torch.where(
-        trailing_on_target | just_reset,
-        torch.zeros_like(descent_travel_sign),
-        descent_travel_sign,
+    descent_latch = (
+        (descent_latch | confirmed_descent_handoff)
+        & ~trailing_on_target
+        & ~just_reset
     )
-    env._platform_trailing_descent_travel_sign = descent_travel_sign
-    descent_latch = descent_travel_sign != 0.0
-
+    descent_forward = torch.where(
+        confirmed_descent_handoff, commanded_forward, descent_forward
+    )
+    env._platform_trailing_descent_latch = descent_latch
+    env._platform_trailing_descent_forward = descent_forward
     leading_completed = leading_completed | descent_latch
     trailing_is_descent = trailing_is_descent | descent_latch
     trailing_direction = torch.where(
@@ -219,11 +267,13 @@ def _platform_contact_sequence_state(
         settings.wall_force_threshold,
         torch.zeros_like(leading_fz, dtype=torch.bool),
     )
-    trailing_ascent_wall_score, trailing_descent_wall_score = _platform_wall_contact_scores(
-        trailing_forces[..., :2],
-        travel_xy,
-        settings.wall_force_threshold,
-        trailing_exposed_wall,
+    trailing_ascent_wall_score, trailing_descent_wall_score = (
+        _platform_wall_contact_scores(
+            trailing_forces[..., :2],
+            travel_xy,
+            settings.wall_force_threshold,
+            trailing_exposed_wall,
+        )
     )
     trailing_descent_wall_contact = torch.mean(
         trailing_descent_wall_score * (trailing_direction < 0.0).float(),
@@ -252,6 +302,30 @@ def _platform_contact_sequence_state(
     trailing_descent_phase = trailing_descent_phase & descent_latch
     trailing_wall_phase = trailing_wall_phase & descent_latch
 
+    trailing_fxy = torch.linalg.norm(trailing_forces[..., :2], dim=-1)
+    trailing_force_support = (
+        (trailing_fz > settings.support_force_threshold)
+        & (trailing_fxy < settings.top_horizontal_force_ratio * trailing_fz)
+    )
+    trailing_surface_height_error = torch.minimum(
+        torch.abs(
+            trailing_pos_w[..., 2]
+            - (trailing_surface_z + settings.wheel_radius)
+        ),
+        torch.abs(
+            trailing_pos_w[..., 2]
+            - (trailing_next_surface_z + settings.wheel_radius)
+        ),
+    )
+    trailing_tread_support = trailing_force_support & (
+        trailing_surface_height_error < settings.surface_tolerance
+    )
+    trailing_unsupported_time = _platform_update_trailing_unsupported_time(
+        env,
+        trailing_descent_phase[:, None] & ~trailing_tread_support,
+        just_reset,
+    )
+
     return {
         "asset": asset,
         "motion_on_platform": motion_on_platform,
@@ -261,9 +335,12 @@ def _platform_contact_sequence_state(
         "leading_descent_phase": leading_descent_phase,
         "trailing_descent_phase": trailing_descent_phase,
         "trailing_wall_phase": trailing_wall_phase,
-        "trailing_supported": torch.all(trailing_fz > settings.support_force_threshold, dim=1),
+        "trailing_supported": torch.all(
+            trailing_fz > settings.support_force_threshold, dim=1
+        ),
         "support_count": torch.sum(
-            torch.clamp(wheel_forces[..., 2], min=0.0) > settings.support_force_threshold,
+            torch.clamp(wheel_forces[..., 2], min=0.0)
+            > settings.support_force_threshold,
             dim=1,
         ),
         "travel_sign": travel_sign,
@@ -273,8 +350,11 @@ def _platform_contact_sequence_state(
         "trailing_height_delta": trailing_height_delta,
         "leading_vel_z": leading_vel_z,
         "trailing_vel_z": trailing_vel_z,
-        "leading_height_spread": torch.abs(leading_pos_w[:, 0, 2] - leading_pos_w[:, 1, 2]),
+        "leading_height_spread": torch.abs(
+            leading_pos_w[:, 0, 2] - leading_pos_w[:, 1, 2]
+        ),
         "trailing_air_time": trailing_air_time,
+        "trailing_unsupported_time": trailing_unsupported_time,
         "leading_ascent_wall_score": leading_ascent_wall_score,
         "trailing_ascent_wall_score": trailing_ascent_wall_score,
         "trailing_descent_wall_contact": trailing_descent_wall_contact,
@@ -283,20 +363,97 @@ def _platform_contact_sequence_state(
     }
 
 
-def _record_platform_reward_components(
+def _platform_toward_target_progress(
+    vertical_velocity: torch.Tensor,
+    direction: torch.Tensor,
+    height_delta: torch.Tensor,
+    wall_score: torch.Tensor,
+    ascent_speed: float,
+    descent_speed: float,
+    ascent_slowdown_distance: float,
+    ascent_min_speed: float,
+    speed_quadratic_blend: float,
+    ascent_contact_floor: float,
+    backslide_penalty_scale: float,
+) -> torch.Tensor:
+    """Return signed per-wheel progress toward the selected tread."""
+    remaining_distance = torch.clamp(-direction * height_delta, min=0.0)
+    ascent_distance_ratio = torch.clamp(
+        remaining_distance / ascent_slowdown_distance,
+        min=0.0,
+        max=1.0,
+    )
+    ascent_speed_limit = ascent_min_speed + (
+        ascent_speed - ascent_min_speed
+    ) * ascent_distance_ratio
+    speed_limit = torch.where(
+        direction > 0.0,
+        ascent_speed_limit,
+        torch.full_like(direction, descent_speed),
+    )
+    raw_speed_ratio = direction * vertical_velocity / speed_limit
+    speed_ratio = torch.clamp(
+        raw_speed_ratio,
+        min=-1.0,
+        max=1.0,
+    )
+    toward_ratio = torch.clamp(speed_ratio, min=0.0)
+    backslide_ratio = torch.clamp(-speed_ratio, min=0.0)
+    toward_progress = (
+        (1.0 - speed_quadratic_blend) * toward_ratio
+        + speed_quadratic_blend * torch.square(toward_ratio)
+    )
+    ascent_overspeed = torch.clamp(raw_speed_ratio - 1.0, min=0.0, max=1.0)
+    backslide_progress = (
+        (1.0 - speed_quadratic_blend) * backslide_ratio
+        + speed_quadratic_blend * torch.square(backslide_ratio)
+    )
+    ascent_gate = ascent_contact_floor + (1.0 - ascent_contact_floor) * wall_score
+    contact_gate = torch.where(
+        direction > 0.0,
+        ascent_gate,
+        torch.ones_like(wall_score),
+    )
+    return (
+        contact_gate * toward_progress
+        - 2.0 * torch.square(ascent_overspeed) * (direction > 0.0).float()
+        - backslide_penalty_scale * backslide_progress
+    )
+
+
+def _platform_ascent_overshoot(
+    height_delta: torch.Tensor,
+    ascent_mask: torch.Tensor,
+    margin: float,
+    ramp: float,
+) -> torch.Tensor:
+    """Return mean axle over-height, active only while moving upward."""
+    overshoot = torch.square(
+        torch.clamp((height_delta - margin) / ramp, min=0.0, max=1.0)
+    )
+    return torch.mean(overshoot * ascent_mask.float(), dim=1)
+
+
+def _log_platform_reward_components(
     env: ManagerBasedRLEnv,
     components: dict[str, torch.Tensor],
 ) -> None:
-    """Accumulate platform phase rewards for training diagnostics."""
+    """Accumulate diagnostic components without adding reward terms."""
     reward_manager = env.reward_manager
-    weight = reward_manager.get_term_cfg(_PLATFORM_REWARD_TERM).weight
-    scale = float(weight) * float(env.step_dt)
-    template = reward_manager._episode_sums[_PLATFORM_REWARD_TERM]
-
+    parent_buffer = reward_manager._episode_sums[_PLATFORM_REWARD_TERM]
+    scale = (
+        float(reward_manager.get_term_cfg(_PLATFORM_REWARD_TERM).weight)
+        * float(env.step_dt)
+    )
     for name, component in components.items():
         key = f"{_PLATFORM_REWARD_TERM}/{name}"
-        buffer = reward_manager._episode_sums.setdefault(key, torch.zeros_like(template))
-        buffer.add_(component.detach().to(buffer), alpha=scale)
+        if key not in reward_manager._episode_sums:
+            reward_manager._episode_sums[key] = torch.zeros_like(parent_buffer)
+        buffer = reward_manager._episode_sums[key]
+        buffer.add_(
+            component.detach().to(device=buffer.device, dtype=buffer.dtype),
+            alpha=scale,
+        )
 
 
 def platform_traversal_reward(
@@ -353,8 +510,7 @@ def platform_traversal_reward(
         settings.ascent_overshoot_ramp,
     )
     leading_reward = leading_phase * (
-        state["trailing_supported"].float()
-        * torch.mean(
+        state["trailing_supported"].float() * torch.mean(
             leading_progress * state["leading_needs_progress"].float(),
             dim=1,
         )
@@ -363,7 +519,8 @@ def platform_traversal_reward(
     trailing_phase = state["trailing_phase"].float()
     trailing_overshoot = _platform_ascent_overshoot(
         state["trailing_height_delta"],
-        (state["leading_direction"] > 0.0) | (state["trailing_direction"] > 0.0),
+        (state["leading_direction"] > 0.0)
+        | (state["trailing_direction"] > 0.0),
         settings.ascent_overshoot_margin,
         settings.ascent_overshoot_ramp,
     )
@@ -375,12 +532,13 @@ def platform_traversal_reward(
         - settings.ascent_overshoot_penalty_scale * trailing_overshoot
     )
     trailing_penalty = state["trailing_descent_phase"].float() * (
-        settings.trailing_descent_wall_penalty_scale * state["trailing_descent_wall_contact"]
+        settings.trailing_descent_wall_penalty_scale
+        * state["trailing_descent_wall_contact"]
         + settings.trailing_descent_phase_penalty
     )
     leading_descent = state["leading_descent_phase"].float()
     trailing_descent = state["trailing_descent_phase"].float()
-    _record_platform_reward_components(
+    _log_platform_reward_components(
         env,
         {
             "ascent_leading": leading_reward * (1.0 - leading_descent),
@@ -393,6 +551,16 @@ def platform_traversal_reward(
         },
     )
     return leading_reward + trailing_reward - trailing_penalty
+
+
+def _squared_excess(
+    value: torch.Tensor,
+    threshold: float,
+    scale: float,
+) -> torch.Tensor:
+    return torch.square(
+        torch.clamp((value - threshold) / scale, min=0.0, max=1.0)
+    )
 
 
 def platform_safety_cost(
@@ -425,13 +593,15 @@ def platform_safety_cost(
     ).amax(dim=(1, 2))
 
     sequence_cost = state["sequence_phase"].float() * torch.clamp(
-        (state["trailing_air_time"] - settings.air_time_grace) / settings.air_time_ramp,
+        (state["trailing_air_time"] - settings.air_time_grace)
+        / settings.air_time_ramp,
         min=0.0,
         max=1.0,
     ).mean(dim=1)
 
     support_deficit = torch.clamp(
-        (settings.min_support_count - state["support_count"]).float() / float(settings.min_support_count),
+        (settings.min_support_count - state["support_count"]).float()
+        / float(settings.min_support_count),
         min=0.0,
         max=1.0,
     )
@@ -439,9 +609,15 @@ def platform_safety_cost(
         torch.abs(asset.data.root_lin_vel_w[:, 2]) / settings.vertical_speed_scale,
         max=1.0,
     )
-    ballistic_cost = state["motion_on_platform"].float() * support_deficit * torch.square(root_vertical_speed)
+    ballistic_cost = (
+        state["motion_on_platform"].float()
+        * support_deficit
+        * torch.square(root_vertical_speed)
+    )
 
-    leading_ascent_phase = state["leading_phase"] & ~state["leading_descent_phase"]
+    leading_ascent_phase = (
+        state["leading_phase"] & ~state["leading_descent_phase"]
+    )
     leading_axle_sync_cost = leading_ascent_phase.float() * _squared_excess(
         state["leading_height_spread"],
         settings.leading_axle_sync_tolerance,
@@ -471,7 +647,7 @@ def platform_safety_cost(
 
     trailing_hang_cost = state["trailing_descent_phase"].float() * (
         _platform_descent_stall_cost(
-            state["trailing_air_time"],
+            state["trailing_unsupported_time"],
             state["trailing_vel_z"],
             settings.trailing_descent_air_time_grace,
             settings.trailing_descent_air_time_ramp,
@@ -483,7 +659,10 @@ def platform_safety_cost(
         * torch.square(state["trailing_descent_wall_contact"]),
         max=1.0,
     )
-    tilt_angle = torch.acos(torch.clamp(-asset.data.projected_gravity_b[:, 2], min=-1.0, max=1.0))
+
+    tilt_angle = torch.acos(
+        torch.clamp(-asset.data.projected_gravity_b[:, 2], min=-1.0, max=1.0)
+    )
     tilt_cost = _squared_excess(
         tilt_angle,
         settings.max_descent_tilt,
@@ -494,7 +673,9 @@ def platform_safety_cost(
         settings.max_descent_ang_vel,
         settings.max_descent_ang_vel,
     )
-    descent_phase = state["leading_descent_phase"] | state["trailing_descent_phase"]
+    descent_phase = (
+        state["leading_descent_phase"] | state["trailing_descent_phase"]
+    )
     stability_cost = descent_phase.float() * torch.maximum(tilt_cost, angular_cost)
     leading_pitch_cost = descent_phase.float() * _squared_excess(
         torch.clamp(state["travel_sign"] * asset.data.root_ang_vel_b[:, 1], min=0.0),
@@ -513,9 +694,9 @@ def platform_safety_cost(
     )
     base_cost = torch.maximum(
         base_cost,
-        torch.maximum(
-            leading_axle_sync_cost,
-            torch.maximum(leading_pitch_cost, base_impact_cost),
-        ),
+        torch.maximum(leading_axle_sync_cost, torch.maximum(leading_pitch_cost, base_impact_cost)),
     )
-    return torch.maximum(base_cost, torch.maximum(trailing_hang_cost, trailing_wall_cost))
+    return torch.maximum(
+        base_cost,
+        torch.maximum(trailing_hang_cost, trailing_wall_cost),
+    )

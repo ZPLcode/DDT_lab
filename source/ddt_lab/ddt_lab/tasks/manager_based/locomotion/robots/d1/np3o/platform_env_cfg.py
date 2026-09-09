@@ -45,13 +45,38 @@ class PlatformSceneCfg(SceneCfg):
 
 
 class D1PlatformRLEnv(ManagerBasedRLEnv):
-    """Clip ordinary rewards before adding the termination penalty."""
+    """Clip ordinary rewards before adding safety and termination penalties."""
+
+    _UNCLIPPED_PENALTY_TERMS = (
+        "contact_forces",
+        "descent_front_impact",
+        "ascent_rear_lateral_force",
+        "descent_axle_support",
+    )
 
     def step(self, action: torch.Tensor):
         observations, reward, terminated, time_out, extras = super().step(action)
+        penalty_indices = getattr(self, "_unclipped_penalty_term_indices", None)
+        if penalty_indices is None:
+            active_terms = self.reward_manager.active_terms
+            missing_terms = [name for name in self._UNCLIPPED_PENALTY_TERMS if name not in active_terms]
+            if missing_terms:
+                raise RuntimeError(f"Missing unclipped platform reward terms: {missing_terms}")
+            penalty_indices = [active_terms.index(name) for name in self._UNCLIPPED_PENALTY_TERMS]
+            self._unclipped_penalty_term_indices = penalty_indices
+
+        # RewardManager stores per-term weighted rewards before dt scaling.
+        unclipped_penalty_reward = (
+            self.reward_manager._step_reward[:, penalty_indices].sum(dim=1) * self.step_dt
+        )
         termination_cfg = self.reward_manager.get_term_cfg("is_terminated")
         termination_reward = terminated.float() * termination_cfg.weight * self.step_dt
-        reward = torch.clamp(reward - termination_reward, min=0.0) + termination_reward
+        regular_reward = reward - termination_reward - unclipped_penalty_reward
+        reward = (
+            torch.clamp(regular_reward, min=0.0)
+            + unclipped_penalty_reward
+            + termination_reward
+        )
         self.reward_buf = reward
         return observations, reward, terminated, time_out, extras
 
@@ -94,38 +119,11 @@ class PlatformCommandsCfg(CommandsCfg):
     )
 
 
-def _platform_term_params() -> dict[str, object]:
-    return {
-        "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-        "wheel_sensor_cfg": SceneEntityCfg(
-            "contact_forces",
-            body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-            preserve_order=True,
-        ),
-        "wheel_asset_cfg": SceneEntityCfg(
-            "robot",
-            body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-            preserve_order=True,
-        ),
-        "command_name": "base_velocity",
-        "terrain_type_start": D1_PLATFORM_TERRAIN_START,
-        "settings": mdp.PlatformTraversalSettings(),
-    }
-
-
 @configclass
 class PlatformRewardsCfg(RoughRewardsCfg):
-    """Reward terms for supported platform traversal."""
+    """Reward terms for command-conditioned platform locomotion."""
 
     is_terminated = RewTerm(func=mdp.is_terminated, weight=-0.8)
-    highplatform_yaw = RewTerm(
-        func=mdp.heading_command_error_l2,
-        weight=-2.0,
-        params={
-            "command_name": "base_velocity",
-            "terrain_type_start": D1_PLATFORM_TERRAIN_START,
-        },
-    )
     feet_stumble = RewTerm(
         func=mdp.platform_feet_stumble,
         weight=-0.1,
@@ -136,16 +134,90 @@ class PlatformRewardsCfg(RoughRewardsCfg):
     )
     contact_forces = RewTerm(
         func=mdp.platform_landing_force_penalty,
-        weight=-2.0e-4,
+        weight=-4.0e-3,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-            "threshold": 500.0,
+            "threshold": 400.0,
         },
     )
-    platform_traversal = RewTerm(
-        func=mdp.platform_traversal_reward,
-        weight=1.5,
-        params=_platform_term_params(),
+    descent_front_impact = RewTerm(
+        func=mdp.platform_descent_front_impact_penalty,
+        weight=-8.0e-3,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["FL_foot", "FR_foot"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "threshold": 400.0,
+            "terrain_type_start": D1_PLATFORM_DESCENT_TERRAIN_START,
+            "command_threshold": 0.10,
+        },
+    )
+    ascent_rear_lateral_force = RewTerm(
+        func=mdp.platform_ascent_rear_lateral_force_penalty,
+        weight=-4.0e-3,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+            "threshold": 200.0,
+            "terrain_type_start": D1_PLATFORM_TERRAIN_START,
+            "terrain_type_end": D1_PLATFORM_DESCENT_TERRAIN_START,
+        },
+    )
+    ascent_diagnostics = RewTerm(
+        func=mdp.platform_ascent_diagnostics,
+        weight=1.0,
+        params={
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "wheel_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+            "wheel_asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "terrain_type_start": D1_PLATFORM_TERRAIN_START,
+            "terrain_type_end": D1_PLATFORM_DESCENT_TERRAIN_START,
+            "wheel_radius": 0.087,
+            "lift_height": 0.04,
+            "surface_tolerance": 0.04,
+            "support_force_threshold": 10.0,
+            "top_horizontal_force_ratio": 2.0,
+            "support_history_steps": 10,
+            "stable_history_fraction": 0.8,
+            "plane_residual_gate_std": 0.015,
+            "transition_gate_threshold": 0.10,
+        },
+    )
+    descent_axle_support = RewTerm(
+        func=mdp.platform_descent_axle_support_penalty,
+        weight=-0.1,
+        params={
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "wheel_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "command_name": "base_velocity",
+            "terrain_type_start": D1_PLATFORM_DESCENT_TERRAIN_START,
+            "support_force_threshold": 10.0,
+            "top_horizontal_force_ratio": 2.0,
+            "support_history_steps": 10,
+            "stable_history_fraction": 0.8,
+            "plane_residual_gate_std": 0.015,
+            "transition_gate_threshold": 0.10,
+        },
     )
     lin_vel_z_l2 = RewTerm(
         func=mdp.discontinuity_gated_lin_vel_z_l2,
@@ -194,12 +266,10 @@ class PlatformRewardsCfg(RoughRewardsCfg):
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
             "target_height": 0.04,
-            "yaw_target_height": 0.04,
             "std": 0.03,
             "wheel_radius": 0.087,
             "command_threshold": 0.10,
             "max_air_time": 0.20,
-            "landing_confirm_time": 0.08,
             "hover_penalty_scale": 2.0,
             "min_contact": 2,
             "lift_penalty_scale": 100.0,
@@ -207,6 +277,7 @@ class PlatformRewardsCfg(RoughRewardsCfg):
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
             "plane_residual_gate_std": 0.015,
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "upright_gate": False,
         },
     )
     zero_command_base_motion_l2 = RewTerm(
@@ -297,7 +368,7 @@ class PlatformRewardsCfg(RoughRewardsCfg):
 
 @configclass
 class PlatformCostsCfg(CostsCfg):
-    """Safety costs used by the platform task."""
+    """Generic joint-limit costs used by the platform task."""
 
     joint_pos_limit = CostTermCfg(
         func=mdp.joint_pos_limit,
@@ -320,15 +391,8 @@ class PlatformCostsCfg(CostsCfg):
         k_value=0.01,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
-            "safe_limit": 75.0,
+            "safe_limit": 60.0,
         },
-    )
-    platform_safety = CostTermCfg(
-        func=mdp.platform_safety_cost,
-        scale=1.0,
-        d_value=0.0,
-        k_value=0.05,
-        params=_platform_term_params(),
     )
 
 
@@ -341,7 +405,7 @@ class PlatformTerminationsCfg(TerminationsCfg):
 
 @configclass
 class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
-    """Platform curriculum with supported ascent and descent shaping."""
+    """Platform curriculum driven by velocity-command tracking."""
 
     scene: PlatformSceneCfg = PlatformSceneCfg(num_envs=4096, env_spacing=2.5)
     commands: PlatformCommandsCfg = PlatformCommandsCfg()
@@ -383,7 +447,7 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
         self.rewards.track_lin_vel_xy_exp.weight = 2.0
         self.rewards.track_ang_vel_z_exp.weight = 1.0
         self.rewards.flat_orientation_l2 = None
-        self.rewards.action_rate_l2.weight = -0.01
+        self.rewards.action_rate_l2.weight = -0.02
         for name in (
             "track_lin_vel_xy_exp",
             "track_ang_vel_z_exp",

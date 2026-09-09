@@ -56,6 +56,57 @@ def _resolve_runner_cfg(entry_point: str) -> dict:
     return cfg
 
 
+def _load_checkpoint(runner: OnConstraintPolicyRunner, checkpoint: str) -> None:
+    """Load strictly, except for obsolete cost-head shapes during policy-only export."""
+    if not args_cli.export_policy:
+        runner.load(checkpoint, load_optimizer=False)
+        return
+
+    loaded = torch.load(checkpoint, map_location=runner.device)
+    source_state = loaded["model_state_dict"]
+    target_state = runner.alg.actor_critic.state_dict()
+    mismatched = {
+        name
+        for name, value in source_state.items()
+        if name in target_state and value.shape != target_state[name].shape
+    }
+    non_cost_mismatches = sorted(name for name in mismatched if not name.startswith("cost."))
+    if non_cost_mismatches:
+        raise RuntimeError(
+            "Policy export refused non-cost checkpoint shape mismatches: "
+            f"{non_cost_mismatches}"
+        )
+
+    compatible_state = {
+        name: value
+        for name, value in source_state.items()
+        if name in target_state and name not in mismatched
+    }
+    incompatible = runner.alg.actor_critic.load_state_dict(compatible_state, strict=False)
+    missing_non_cost = sorted(
+        name for name in incompatible.missing_keys if not name.startswith("cost.")
+    )
+    unexpected_non_cost = sorted(
+        {
+            name
+            for name in incompatible.unexpected_keys
+            if not name.startswith("cost.")
+        }
+        | {
+            name
+            for name in source_state
+            if name not in target_state and not name.startswith("cost.")
+        }
+    )
+    if missing_non_cost or unexpected_non_cost:
+        raise RuntimeError(
+            "Policy export refused incomplete actor/critic checkpoint loading: "
+            f"missing={missing_non_cost}, unexpected={unexpected_non_cost}"
+        )
+    if mismatched:
+        print(f"[INFO] Policy-only export skipped obsolete cost tensors: {sorted(mismatched)}")
+
+
 def main():
     spec = gym.spec(args_cli.task)
     runner_cfg = _resolve_runner_cfg(spec.kwargs["np3o_cfg_entry_point"])
@@ -75,10 +126,14 @@ def main():
     runner = OnConstraintPolicyRunner(env, runner_cfg, log_dir=None, device=args_cli.device or "cuda:0")
 
     log_root = os.path.abspath(os.path.join("logs", "np3o", runner_cfg["runner"]["experiment_name"]))
-    ckpt_key = args_cli.checkpoint if args_cli.checkpoint is not None else args_cli.load_checkpoint
-    ckpt = get_checkpoint_path(log_root, args_cli.load_run, ckpt_key)
+    if args_cli.checkpoint is not None:
+        ckpt = os.path.abspath(args_cli.checkpoint)
+        if not os.path.isfile(ckpt):
+            raise FileNotFoundError(f"Checkpoint does not exist: {ckpt}")
+    else:
+        ckpt = get_checkpoint_path(log_root, args_cli.load_run, args_cli.load_checkpoint)
     print(f"[INFO] loading checkpoint: {ckpt}")
-    runner.load(ckpt, load_optimizer=False)
+    _load_checkpoint(runner, ckpt)
 
     # Always export the JIT/ONNX policy next to the checkpoint (matches the
     # pre-NP3O scripts/rsl_rl/play.py behavior). Skip on --export_policy off

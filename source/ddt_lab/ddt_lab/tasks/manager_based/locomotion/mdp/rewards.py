@@ -1166,6 +1166,7 @@ def foot_clearance(
     terrain_sensor_cfg: SceneEntityCfg | None = None,
     plane_residual_gate_std: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    upright_gate: bool = True,
 ) -> torch.Tensor:
     """Shape swing clearance for lateral/yaw motion and suppress it while rolling."""
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -1251,8 +1252,10 @@ def foot_clearance(
 
     inactive_term = -lift_penalty_scale * torch.clamp(clearance, min=0.0).pow(2)
     reward = torch.where(active, active_term, in_air.float() * inactive_term)
-    upright_gate = torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
-    return reward.sum(dim=-1) * planar_gate * upright_gate
+    result = reward.sum(dim=-1) * planar_gate
+    if upright_gate:
+        result *= torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    return result
 
 
 def wheel_roll_reward(

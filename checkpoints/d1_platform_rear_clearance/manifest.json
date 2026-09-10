@@ -1,0 +1,57 @@
+{
+  "task": "DDT-Velocity-Platform-D1-NP3O-v0",
+  "algorithm": "NP3O",
+  "checkpoint": "model_8200.pt",
+  "iteration": 8200,
+  "checkpoint_sha256": "931cad6b6beb803ab4f1d2f02e6c106da83158e7fbfca1343033d864fa2ead00",
+  "checkpoint_size_bytes": 9131634,
+  "includes_optimizer": true,
+  "model_and_optimizer_finite": true,
+  "training_run": "2026-09-10_05-50-48",
+  "seed": 42,
+  "num_envs": 4096,
+  "training_ascent_height_range_m": [
+    0.05,
+    1.0
+  ],
+  "code_ascent_height_range_m": [
+    0.3,
+    1.0
+  ],
+  "trained_with_30cm_minimum_curriculum": false,
+  "training_reward_parameters": {
+    "approach_penalty_scale": 3.645,
+    "clearance_bonus": 0.390625,
+    "landing_bonus": 1.0,
+    "wall_penalty_scale": 0.5,
+    "approach_distance": 0.3,
+    "clearance_margin": 0.06,
+    "wall_force_threshold": 20.0
+  },
+  "robot_repository": "https://github.com/DDTRobot/ddt_ros2_control",
+  "robot_branch": "compress_v1",
+  "robot_commit": "9e45c8cea6a7517ae2df7064e2030391c382c161",
+  "d1_urdf_sha256": "7f4fed32547e0c2a35b247e6f28d4d6bffb7f6b10c827279d532f71e2dd3487e",
+  "versions": {
+    "torch": "2.7.0+cu128",
+    "isaaclab": "0.54.2",
+    "isaacsim": "5.1.0.0",
+    "numpy": "2.4.6",
+    "gymnasium": "1.2.1",
+    "ddt_lab": "0.1.0"
+  },
+  "base_code_commit": "8537e748d3eb86df8879b94a501a3d2ed223fa4a",
+  "training_source_sha256": {
+    "scripts/np3o/train.py": "3964e84aa616709a55773e1a0c20769ef1c3fe6d065feafddb8a3997aec6324d",
+    "scripts/np3o/evaluate_platform.py": "3e769f95c01c6c87bd106b1bb1cdae84cace0a19d3bc50fd8d9bbc285eca1d93",
+    "scripts/np3o/platform_tuning.py": "70156f0711da5c82ea5ceada9b6f85af394ed2abd72c81b2873ad01ab9b80d3a",
+    "source/ddt_lab/ddt_lab/tasks/manager_based/locomotion/mdp/rear_step_rewards.py": "3dec4879b8ee0fb28dabbb39f468b5826848a723721e5c1b90a7d7e85f2cb2f4",
+    "source/ddt_lab/ddt_lab/tasks/manager_based/locomotion/mdp/curriculums.py": "7a33cfaf80913735a45a19879bd6829b8e26c50ce1acb6095a291890c0541ff7",
+    "source/ddt_lab/ddt_lab/tasks/manager_based/locomotion/robots/d1/np3o/platform_env_cfg.py": "6f0f0e099e2aa9bb3054f93aad7958e9b7e61ba2c4ceb5e59dc19b4cfdc27645",
+    "source/ddt_lab/ddt_lab/algorithms/np3o/runner.py": "51eb766507c00f90073b24d93e6f8092792967f0358015ca296581c00ae59928",
+    "ddt_ros2_control/urdfs/d1_description/urdf/robot.urdf": "7f4fed32547e0c2a35b247e6f28d4d6bffb7f6b10c827279d532f71e2dd3487e"
+  },
+  "status": "stopped_by_user",
+  "training_stopped_at": "2026-09-10T09:06:36.089501+08:00",
+  "note": "Latest saved checkpoint, not a best-model selection. Training stopped before resuming with the new 30 cm minimum. The 30/40 cm evaluation protocol migration was interrupted and no complete new baseline is claimed."
+}

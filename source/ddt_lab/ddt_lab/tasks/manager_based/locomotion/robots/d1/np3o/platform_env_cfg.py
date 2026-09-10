@@ -45,38 +45,33 @@ class PlatformSceneCfg(SceneCfg):
 
 
 class D1PlatformRLEnv(ManagerBasedRLEnv):
-    """Clip ordinary rewards before adding safety and termination penalties."""
+    """Clip ordinary rewards before adding traversal, safety and termination terms."""
 
-    _UNCLIPPED_PENALTY_TERMS = (
+    _UNCLIPPED_REWARD_TERMS = (
         "contact_forces",
         "descent_front_impact",
         "ascent_rear_lateral_force",
         "descent_axle_support",
+        "ascent_rear_step",
     )
 
     def step(self, action: torch.Tensor):
         observations, reward, terminated, time_out, extras = super().step(action)
-        penalty_indices = getattr(self, "_unclipped_penalty_term_indices", None)
-        if penalty_indices is None:
+        term_indices = getattr(self, "_unclipped_reward_term_indices", None)
+        if term_indices is None:
             active_terms = self.reward_manager.active_terms
-            missing_terms = [name for name in self._UNCLIPPED_PENALTY_TERMS if name not in active_terms]
+            missing_terms = [name for name in self._UNCLIPPED_REWARD_TERMS if name not in active_terms]
             if missing_terms:
                 raise RuntimeError(f"Missing unclipped platform reward terms: {missing_terms}")
-            penalty_indices = [active_terms.index(name) for name in self._UNCLIPPED_PENALTY_TERMS]
-            self._unclipped_penalty_term_indices = penalty_indices
+            term_indices = [active_terms.index(name) for name in self._UNCLIPPED_REWARD_TERMS]
+            self._unclipped_reward_term_indices = term_indices
 
         # RewardManager stores per-term weighted rewards before dt scaling.
-        unclipped_penalty_reward = (
-            self.reward_manager._step_reward[:, penalty_indices].sum(dim=1) * self.step_dt
-        )
+        unclipped_reward = self.reward_manager._step_reward[:, term_indices].sum(dim=1) * self.step_dt
         termination_cfg = self.reward_manager.get_term_cfg("is_terminated")
         termination_reward = terminated.float() * termination_cfg.weight * self.step_dt
-        regular_reward = reward - termination_reward - unclipped_penalty_reward
-        reward = (
-            torch.clamp(regular_reward, min=0.0)
-            + unclipped_penalty_reward
-            + termination_reward
-        )
+        regular_reward = reward - termination_reward - unclipped_reward
+        reward = torch.clamp(regular_reward, min=0.0) + unclipped_reward + termination_reward
         self.reward_buf = reward
         return observations, reward, terminated, time_out, extras
 
@@ -196,6 +191,29 @@ class PlatformRewardsCfg(RoughRewardsCfg):
             "stable_history_fraction": 0.8,
             "plane_residual_gate_std": 0.015,
             "transition_gate_threshold": 0.10,
+        },
+    )
+    ascent_rear_step = RewTerm(
+        func=mdp.RearWheelStepReward,
+        weight=1.0,
+        params={
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "wheel_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+            "wheel_asset_cfg": SceneEntityCfg(
+                "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True
+            ),
+            "command_name": "base_velocity",
+            "terrain_type_start": D1_PLATFORM_TERRAIN_START,
+            "terrain_type_end": D1_PLATFORM_DESCENT_TERRAIN_START,
+            "clearance_margin": 0.06,
+            "clearance_bonus": 0.25,
+            "landing_bonus": 1.0,
+            "wall_force_threshold": 20.0,
+            "wall_penalty_scale": 0.5,
+            "approach_distance": 0.30,
+            "approach_penalty_scale": 2.0,
         },
     )
     descent_axle_support = RewTerm(
@@ -432,6 +450,8 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
             params={
                 "move_up_terrain_type_start": D1_PLATFORM_DESCENT_TERRAIN_START,
                 "move_up_distance_override": 3.0,
+                "clean_ascent_reward_term": "ascent_rear_step",
+                "clean_ascent_terrain_range": (D1_PLATFORM_TERRAIN_START, D1_PLATFORM_DESCENT_TERRAIN_START),
             },
         )
         self.curriculum.highplatform_levels = CurrTerm(
@@ -485,16 +505,14 @@ class D1PlatformNP3OEnvCfg(D1RoughNP3OEnvCfg):
         }
         self.events.randomize_actuator_gains.params["stiffness_distribution_params"] = (0.85, 1.15)
         self.events.randomize_actuator_gains.params["damping_distribution_params"] = (0.85, 1.15)
-        self.events.reset_base.params["pose_range"].update(
-            {
-                "x": (-0.50, 0.50),
-                "y": (-0.50, 0.50),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-            }
-        )
+        self.events.reset_base.params["pose_range"].update({
+            "x": (-0.50, 0.50),
+            "y": (-0.50, 0.50),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        })
         self.disable_zero_weight_rewards()
 
 

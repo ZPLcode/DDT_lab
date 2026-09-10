@@ -1,0 +1,56 @@
+runner:
+  policy_class_name: ActorCriticBarlowTwins
+  algorithm_class_name: NP3O
+  runner_class_name: OnConstraintPolicyRunner
+  num_steps_per_env: 24
+  max_iterations: 14000
+  save_interval: 100
+  experiment_name: d1_platform_rear_clearance_compress_v1
+  run_name: ''
+  resume: true
+  load_run: ^2026\-09\-10_01\-23\-12$
+  load_checkpoint: ^model_6000\.pt$
+algorithm:
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.01
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.001
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  cost_value_loss_coef: 0.1
+  cost_viol_loss_coef: 0.1
+  use_symmetry: true
+  use_fa_symmetry: false
+  mirror_coef: 0.5
+policy:
+  init_noise_std: 1.0
+  actor_hidden_dims:
+  - 512
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 512
+  - 256
+  - 128
+  priv_encoder_dims: []
+  scan_encoder_dims:
+  - 128
+  - 64
+  - 32
+  activation: elu
+  imi_flag: true
+  bt_window: 5
+  bt_mlp_encoder_dims:
+  - 128
+  - 64
+  bt_latent_encoder_dims:
+  - 32
+  - 16
+  bt_projector_dims:
+  - 64

@@ -52,7 +52,7 @@ def _call_keywords(call: ast.Call) -> dict[str, ast.expr]:
     return {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
 
 
-def test_platform_terrain_and_curriculum_contract_remain_unchanged():
+def test_platform_terrain_contract_and_clean_ascent_curriculum_wiring():
     terrain_tree = _tree(PLATFORM_TERRAIN)
     terrain_call = _module_assignment(terrain_tree, "D1_PLATFORM_TERRAINS_CFG")
     assert isinstance(terrain_call, ast.Call)
@@ -74,7 +74,9 @@ def test_platform_terrain_and_curriculum_contract_remain_unchanged():
         keywords = _call_keywords(value)
         assert ast.literal_eval(keywords["proportion"]) == 0.30
         assert isinstance(keywords["step_height_range"], ast.Name)
-        assert keywords["step_height_range"].id == "D1_HIGH_PLATFORM_HEIGHT_RANGE"
+        assert keywords["step_height_range"].id == (
+            "D1_HIGH_PLATFORM_ASCENT_HEIGHT_RANGE" if index == 0 else "D1_HIGH_PLATFORM_HEIGHT_RANGE"
+        )
         assert ast.literal_eval(keywords.get("inverted", ast.Constant(False))) is (index == 0)
 
     rocky_cfg = _class(terrain_tree, "MeshRockyPyramidStairsTerrainCfg")
@@ -89,10 +91,13 @@ def test_platform_terrain_and_curriculum_contract_remain_unchanged():
     assert ast.literal_eval(_module_assignment(terrain_tree, "D1_PLATFORM_TERRAIN_START")) == 0.40
     assert ast.literal_eval(_module_assignment(terrain_tree, "D1_PLATFORM_DESCENT_TERRAIN_START")) == 0.70
     assert ast.literal_eval(_module_assignment(terrain_tree, "D1_HIGH_PLATFORM_HEIGHT_RANGE")) == (0.05, 1.00)
+    assert ast.literal_eval(_module_assignment(terrain_tree, "D1_HIGH_PLATFORM_ASCENT_HEIGHT_RANGE")) == (0.30, 1.00)
 
     cfg_source = _read(PLATFORM_CFG)
     assert "self.scene.terrain.terrain_generator = D1_PLATFORM_TERRAINS_CFG.copy()" in cfg_source
     assert "self.scene.terrain.max_init_terrain_level = 5" in cfg_source
+    assert '"clean_ascent_reward_term": "ascent_rear_step"' in cfg_source
+    assert '"clean_ascent_terrain_range": (D1_PLATFORM_TERRAIN_START, D1_PLATFORM_DESCENT_TERRAIN_START)' in cfg_source
     assert '"move_up_terrain_type_start": D1_PLATFORM_DESCENT_TERRAIN_START' in cfg_source
     assert '"up": ("highplatform_up",)' in cfg_source
     assert '"down": ("highplatform_down",)' in cfg_source
@@ -134,7 +139,7 @@ def test_platform_commands_and_actor_observation_abi_remain_unchanged():
     assert "self.observations.policy.flatten_history_dim = False" in rough_source
 
 
-def test_platform_guidance_stays_stateless_and_reward_only():
+def test_platform_guidance_preserves_baseline_terms_and_rear_step_shaping():
     platform_tree = _tree(PLATFORM_CFG)
     platform_env = _class(platform_tree, "D1PlatformRLEnv")
     rewards = _class(platform_tree, "PlatformRewardsCfg")
@@ -153,22 +158,20 @@ def test_platform_guidance_stays_stateless_and_reward_only():
         node.value
         for node in platform_env.body
         if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_UNCLIPPED_PENALTY_TERMS"
-            for target in node.targets
-        )
+        and any(isinstance(target, ast.Name) and target.id == "_UNCLIPPED_REWARD_TERMS" for target in node.targets)
     )
     assert ast.literal_eval(unclipped_terms) == (
         "contact_forces",
         "descent_front_impact",
         "ascent_rear_lateral_force",
         "descent_axle_support",
+        "ascent_rear_step",
     )
     step_source = ast.unparse(
         next(node for node in platform_env.body if isinstance(node, ast.FunctionDef) and node.name == "step")
     )
-    assert "reward_manager._step_reward[:, penalty_indices]" in step_source
-    assert "regular_reward = reward - termination_reward - unclipped_penalty_reward" in step_source
+    assert "reward_manager._step_reward[:, term_indices]" in step_source
+    assert "regular_reward = reward - termination_reward - unclipped_reward" in step_source
     assert "torch.clamp(regular_reward, min=0.0)" in step_source
 
     contact_force_call = next(
@@ -207,8 +210,7 @@ def test_platform_guidance_stays_stateless_and_reward_only():
     reward_calls = {
         target.id: node.value
         for node in rewards.body
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Call)
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
         for target in node.targets
         if isinstance(target, ast.Name)
     }

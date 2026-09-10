@@ -21,4 +21,5 @@ from .platform_rewards import (  # noqa: F401
     platform_feet_stumble,
     platform_landing_force_penalty,
 )
+from .rear_step_rewards import RearWheelStepReward  # noqa: F401
 from .rewards import *  # noqa: F401, F403

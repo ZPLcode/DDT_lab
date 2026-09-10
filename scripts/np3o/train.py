@@ -19,6 +19,7 @@ parser.add_argument("--resume", action="store_true", help="Resume from latest ch
 parser.add_argument("--load_run", type=str, default=None, help="Run dir regex when resuming.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint filename regex.")
 parser.add_argument("--experiment_name", type=str, default=None, help="Override experiment name.")
+parser.add_argument("--platform_tuning", type=str, default=None, help="Validated platform tuning JSON for automatic checks.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -59,6 +60,13 @@ def main():
 
     env_cfg_entry = spec.kwargs["env_cfg_entry_point"]
     env_cfg = env_cfg_entry() if callable(env_cfg_entry) else env_cfg_entry
+    if args_cli.platform_tuning is not None:
+        if args_cli.task != "DDT-Velocity-Platform-D1-NP3O-v0":
+            raise ValueError("--platform_tuning is supported only for the D1 platform training task.")
+        from platform_tuning import apply_tuning
+
+        applied = apply_tuning(env_cfg, args_cli.platform_tuning)
+        print(f"[INFO] Platform tuning: {applied}")
 
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs

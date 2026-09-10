@@ -20,6 +20,7 @@ D1_FLAT_X_TERRAIN_END = 0.10
 D1_PLATFORM_TERRAIN_START = 0.40
 D1_PLATFORM_DESCENT_TERRAIN_START = 0.70
 D1_HIGH_PLATFORM_HEIGHT_RANGE = (0.05, 1.00)
+D1_HIGH_PLATFORM_ASCENT_HEIGHT_RANGE = (0.30, 1.00)
 
 
 def _smooth_face_noise(shape: tuple[int, int], amplitude: float, smoothing_passes: int) -> np.ndarray:
@@ -302,7 +303,7 @@ D1_PLATFORM_TERRAINS_CFG = TerrainGeneratorCfg(
         ),
         "highplatform_up": MeshRockyPyramidStairsTerrainCfg(
             proportion=0.30,
-            step_height_range=D1_HIGH_PLATFORM_HEIGHT_RANGE,
+            step_height_range=D1_HIGH_PLATFORM_ASCENT_HEIGHT_RANGE,
             step_width=1.0,
             platform_width=3.0,
             border_width=0.25,

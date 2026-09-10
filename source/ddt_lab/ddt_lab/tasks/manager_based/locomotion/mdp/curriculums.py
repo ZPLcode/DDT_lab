@@ -31,6 +31,8 @@ def terrain_levels_vel(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     move_up_terrain_type_start: float | None = None,
     move_up_distance_override: float | None = None,
+    clean_ascent_reward_term: str | None = None,
+    clean_ascent_terrain_range: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Curriculum based on the distance the robot walked when commanded to move at a desired velocity.
 
@@ -42,6 +44,8 @@ def terrain_levels_vel(
         on different terrain types, check the :class:`isaaclab.terrains.TerrainImporter` class.
 
     Platform descent columns may use a shorter promotion distance.
+    Selected ascent columns can additionally require both rear wheels to have
+    landed cleanly, no wall-contact flag during the episode, and no termination.
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
@@ -53,6 +57,11 @@ def terrain_levels_vel(
         raise ValueError("move_up_terrain_type_start must be in [0, 1).")
     if move_up_distance_override is not None and move_up_distance_override <= 0.0:
         raise ValueError("move_up_distance_override must be positive.")
+    if (clean_ascent_reward_term is None) != (clean_ascent_terrain_range is None):
+        raise ValueError("Clean ascent reward term and terrain range must be set together.")
+    if clean_ascent_terrain_range is not None:
+        if not 0.0 <= clean_ascent_terrain_range[0] < clean_ascent_terrain_range[1] < 1.0:
+            raise ValueError("Clean ascent terrain range must be ordered within [0, 1).")
     # compute the distance the robot walked
     distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
     # robots that walked far enough progress to harder terrains
@@ -72,6 +81,20 @@ def terrain_levels_vel(
     # robots that walked less than half of their required distance go to simpler terrains
     move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5
     move_down *= ~move_up
+    if clean_ascent_reward_term is not None:
+        first = platform_terrain_type_start_index(
+            clean_ascent_terrain_range[0], terrain.cfg.terrain_generator.num_cols
+        )
+        last = platform_terrain_type_start_index(
+            clean_ascent_terrain_range[1], terrain.cfg.terrain_generator.num_cols
+        )
+        ascent = (terrain.terrain_types[env_ids] >= first) & (terrain.terrain_types[env_ids] < last)
+        term = env.reward_manager.get_term_cfg(clean_ascent_reward_term).func
+        clean = term.episode_clean_landed[env_ids].all(dim=1) & ~term.episode_wall_touched[env_ids]
+        clean &= ~env.termination_manager.terminated[env_ids]
+        # Apply after the baseline demotion decision: a dirty traversal holds
+        # its level, even when a large command would otherwise request demotion.
+        move_up &= ~ascent | clean
     # update terrain levels
     terrain.update_env_origins(env_ids, move_up, move_down)
 

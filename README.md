@@ -9,6 +9,10 @@ three RL algorithms built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab/):
 | **NP3O** | BarlowTwins-augmented constrained PPO | `scripts/np3o/` |
 | **DreamWaQ** | CeNet VAE + PPO (implicit terrain estimation) | `scripts/dreamwaq/` |
 
+The latest saved D1 platform model is [checkpoint 8200](checkpoints/d1_platform_rear_clearance/README.md),
+stored alongside its training configuration. The ascent curriculum now starts at 30 cm;
+this checkpoint was saved before training resumed with that new minimum.
+
 ---
 
 ## Prerequisites
@@ -47,7 +51,7 @@ URDF paths are controlled by `DDT_MODEL_DIR` in
 **Default — clone `ddt_ros2_control` inside `ddt_lab`:**
 
 ```bash
-git clone https://github.com/DDTRobot/ddt_ros2_control.git ddt_ros2_control
+git clone --branch compress_v1 --single-branch https://github.com/DDTRobot/ddt_ros2_control.git ddt_ros2_control
 ```
 
 Required layout:

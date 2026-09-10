@@ -10,3 +10,5 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.jit filter=lfs diff=lfs merge=lfs -text
 *.hdf5 filter=lfs diff=lfs merge=lfs -text
+# Public forks cannot upload new Git LFS objects. This 9.1 MB snapshot is stored directly.
+checkpoints/d1_platform_rear_clearance/model_8200.pt -filter -diff -merge -text

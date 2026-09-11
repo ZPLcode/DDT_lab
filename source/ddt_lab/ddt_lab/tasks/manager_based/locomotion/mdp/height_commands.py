@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,10 @@ class HeightVelocityCommand(UniformVelocityCommand):
             raise ValueError("Pure-mode probabilities must sum to at most 1.")
         if cfg.min_linear_speed < 0.0:
             raise ValueError("min_linear_speed must be non-negative.")
+        if not 0.0 < cfg.flat_terrain_end <= 1.0:
+            raise ValueError("flat_terrain_end must be in (0, 1].")
+        if cfg.flat_lin_vel_x[0] >= cfg.flat_lin_vel_x[1]:
+            raise ValueError("flat_lin_vel_x must be an increasing range.")
 
         super().__init__(cfg, env)
         self.hold_position_w = torch.zeros((self.num_envs, 2), device=self.device)
@@ -54,6 +59,12 @@ class HeightVelocityCommand(UniformVelocityCommand):
     def _resample_command(self, env_ids: Sequence[int]):
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         super()._resample_command(env_ids)
+
+        flat = self._flat_env_mask(env_ids)
+        flat_ids = env_ids[flat & ~self.is_standing_env[env_ids]]
+        if len(flat_ids) > 0:
+            flat_x = torch.empty(len(flat_ids), device=self.device)
+            self.vel_command_b[flat_ids, 0] = flat_x.uniform_(*self.cfg.flat_lin_vel_x)
 
         sample = torch.rand(len(env_ids), device=self.device)
         pure_x_end = self.cfg.rel_pure_x_envs
@@ -90,6 +101,18 @@ class HeightVelocityCommand(UniformVelocityCommand):
             self.vel_command_b[pure_yaw_ids, :2] = 0.0
             self.is_heading_env[pure_yaw_ids] = True
 
+    def _flat_env_mask(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Return the environments assigned to flat terrain columns."""
+        terrain = self._env.scene.terrain
+        terrain_generator = terrain.cfg.terrain_generator
+        if terrain_generator is None or not hasattr(terrain, "terrain_types"):
+            return torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+
+        flat_col_max = math.ceil(
+            (self.cfg.flat_terrain_end - 0.001) * terrain_generator.num_cols
+        )
+        return terrain.terrain_types[env_ids] < flat_col_max
+
     def _update_command(self):
         super()._update_command()
         self._update_hold()
@@ -112,3 +135,5 @@ class HeightVelocityCommandCfg(UniformVelocityCommandCfg):
     rel_pure_yaw_envs: float = 0.0
     min_linear_speed: float = 0.0
     hold_threshold: float = 0.05
+    flat_terrain_end: float = 0.10
+    flat_lin_vel_x: tuple[float, float] = (-1.0, 1.0)

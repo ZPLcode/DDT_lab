@@ -199,6 +199,8 @@ class AllTerrainCommandsCfg(CommandsCfg):
         rel_pure_y_envs=0.05,
         rel_pure_yaw_envs=0.05,
         min_linear_speed=0.15,
+        flat_terrain_end=0.10,
+        flat_lin_vel_x=(-1.0, 1.0),
     )
 
 
@@ -495,6 +497,19 @@ class D1HeightAllTerrainNP3OEnvCfg(D1RoughNP3OEnvCfg):
         )
 
     def _configure_curricula_and_terrain(self):
+        self.curriculum.command_levels_lin_vel = CurrTerm(
+            func=mdp.flat_command_levels_lin_vel,
+            params={
+                "command_name": "base_velocity",
+                "reward_term_name": "track_lin_vel_xy_exp",
+                "terrain_type_end": 0.10,
+                "initial_max_speed": 1.0,
+                "final_max_speed": 2.0,
+                "increment": 0.25,
+                "success_threshold": 0.80,
+                "min_samples": 32,
+            },
+        )
         self.curriculum.base_height_cmd = CurrTerm(
             func=mdp.base_height_command_curriculum,
             params={
@@ -612,6 +627,7 @@ def _configure_play(cfg):
     cfg.events.add_base_com = None
     cfg.events.randomize_actuator_gains = None
     cfg.curriculum.terrain_levels = None
+    cfg.curriculum.command_levels_lin_vel = None
     cfg.curriculum.base_height_cmd = None
 
 

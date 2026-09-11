@@ -55,27 +55,6 @@ def terrain_levels_vel(
     return torch.mean(terrain.terrain_levels.float())
 
 
-def base_height_command_curriculum(
-    env: RLTaskEnv,
-    env_ids: Sequence[int],
-    command_name: str = "base_height",
-    start_floor: float = 0.35,
-    end_floor: float = 0.15,
-    full_steps: int = 144000,
-) -> torch.Tensor:
-    """Linearly lower the sampled base-height floor during early training."""
-    del env_ids
-    if full_steps <= 0:
-        raise ValueError("full_steps must be positive.")
-
-    progress = min(1.0, env.common_step_counter / float(full_steps))
-    floor = start_floor + (end_floor - start_floor) * progress
-    term = env.command_manager.get_term(command_name)
-    ceiling = float(term.cfg.ranges.height[1])
-    term.cfg.ranges.height = (float(floor), ceiling)
-    return torch.tensor(floor, device=env.device)
-
-
 def command_levels_lin_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

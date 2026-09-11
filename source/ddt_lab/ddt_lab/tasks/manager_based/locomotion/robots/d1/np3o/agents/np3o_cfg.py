@@ -45,6 +45,5 @@ def d1_height_all_terrain_np3o_runner_cfg() -> dict:
     cfg["runner"]["experiment_name"] = "d1_height_all_terrain"
     cfg["runner"]["max_iterations"] = 30000
     cfg["algorithm"]["use_symmetry"] = True
-    cfg["algorithm"]["use_fa_symmetry"] = False
     cfg["algorithm"]["mirror_coef"] = 0.5
     return cfg

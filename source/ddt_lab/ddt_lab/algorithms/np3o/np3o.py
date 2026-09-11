@@ -18,7 +18,7 @@ import torch.optim as optim
 
 from .actor_critic import ActorCriticBarlowTwins
 from .rollout_storage import RolloutStorageWithCost
-from .symmetry import build_d1_mirror, build_d1_mirror_fa
+from .symmetry import build_d1_mirror
 
 
 class NP3O:
@@ -46,12 +46,9 @@ class NP3O:
         dagger_update_freq=20,
         priv_reg_coef_schedual=[0, 0, 0],
         use_symmetry=False,
-        use_fa_symmetry=False,
         mirror_coef=1.0,
         **kwargs,
     ):
-        if use_fa_symmetry and not use_symmetry:
-            raise ValueError("use_fa_symmetry requires use_symmetry")
         if mirror_coef < 0.0:
             raise ValueError("mirror_coef must be non-negative")
         self.device = device
@@ -86,22 +83,20 @@ class NP3O:
         self.k_value = k_value
         self.substeps = 1
         self.use_symmetry = use_symmetry
-        self.use_fa_symmetry = use_fa_symmetry
         self.mirror_coef = mirror_coef
-        self._mirrors = []
+        self._mirror = None
 
     def _mirror_loss(self, obs_batch):
-        loss = torch.zeros((), device=obs_batch.device)
         backbone = self.actor_critic.actor_teacher_backbone
         training_states = [(module, module.training) for module in backbone.modules()]
         backbone.eval()
         try:
             reference_mean = self.actor_critic.act_inference(obs_batch)
-            for obs_perm, obs_sign, act_perm, act_sign in self._mirrors:
-                mirrored_obs = obs_batch[:, :, obs_perm] * obs_sign
-                mirrored_mean = self.actor_critic.act_inference(mirrored_obs)
-                target_mean = (reference_mean[:, act_perm] * act_sign).detach()
-                loss = loss + torch.mean(torch.square(mirrored_mean - target_mean))
+            obs_perm, obs_sign, act_perm, act_sign = self._mirror
+            mirrored_obs = obs_batch[:, :, obs_perm] * obs_sign
+            mirrored_mean = self.actor_critic.act_inference(mirrored_obs)
+            target_mean = (reference_mean[:, act_perm] * act_sign).detach()
+            loss = torch.mean(torch.square(mirrored_mean - target_mean))
         finally:
             for module, training in training_states:
                 module.training = training
@@ -119,16 +114,14 @@ class NP3O:
     ):
         if self.use_symmetry:
             obs_dim = actor_obs_shape[-1]
-            if obs_dim not in (57, 58) or action_shape[-1] != 16:
+            if obs_dim != 58 or action_shape[-1] != 16:
                 raise ValueError(
-                    "D1 symmetry requires 57 or 58 policy features and 16 actions; "
+                    "D1 height symmetry requires 58 policy features and 16 actions; "
                     f"received actor_obs_shape={actor_obs_shape}, action_shape={action_shape}"
                 )
-            self._mirrors = [build_d1_mirror(self.device, obs_dim)]
-            if self.use_fa_symmetry:
-                self._mirrors.append(build_d1_mirror_fa(self.device, obs_dim))
+            self._mirror = build_d1_mirror(self.device)
             print(
-                f"[NP3O] symmetry: {len(self._mirrors)} transform(s), obs_dim={obs_dim}, coefficient={self.mirror_coef}"
+                f"[NP3O] symmetry: left/right, obs_dim={obs_dim}, coefficient={self.mirror_coef}"
             )
         self.storage = RolloutStorageWithCost(
             num_envs,

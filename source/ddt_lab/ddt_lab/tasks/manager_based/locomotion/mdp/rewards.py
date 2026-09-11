@@ -21,50 +21,6 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def _fit_height_scan_plane_yaw(
-    asset: RigidObject,
-    sensor: RayCaster,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fit a plane to a yaw-aligned scan and return normal, residual, and validity."""
-    raw_hits = sensor.data.ray_hits_w
-    valid = torch.isfinite(raw_hits).all(dim=(1, 2))
-    valid &= (torch.abs(raw_hits) < 1.0e6).all(dim=(1, 2))
-    valid &= torch.isfinite(sensor.data.pos_w).all(dim=1)
-    valid &= torch.isfinite(asset.data.root_quat_w).all(dim=1)
-
-    # Sanitize before plane algebra; masking a NaN only after reduction is too late.
-    hits = torch.where(valid[:, None, None], raw_hits, torch.zeros_like(raw_hits))
-    sensor_pos_w = torch.where(valid[:, None], sensor.data.pos_w, torch.zeros_like(sensor.data.pos_w))
-    root_quat_w = torch.where(valid[:, None], asset.data.root_quat_w, torch.zeros_like(asset.data.root_quat_w))
-    root_quat_w[:, 0] = torch.where(valid, root_quat_w[:, 0], torch.ones_like(root_quat_w[:, 0]))
-
-    relative_hits = hits - sensor_pos_w.unsqueeze(1)
-    num_rays = relative_hits.shape[1]
-    # Remove robot heading so the fitted slopes are expressed in a yaw-aligned frame.
-    yaw = yaw_quat(root_quat_w)
-    yaw_expanded = yaw.unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4)
-    hits_yaw = quat_apply_inverse(yaw_expanded, relative_hits.reshape(-1, 3)).reshape_as(relative_hits)
-
-    # Least-squares fit of z = slope_x * x + slope_y * y.
-    centered = hits_yaw - hits_yaw.mean(dim=1, keepdim=True)
-    x, y, z = centered.unbind(dim=2)
-    xx = torch.mean(x * x, dim=1)
-    yy = torch.mean(y * y, dim=1)
-    xy = torch.mean(x * y, dim=1)
-    xz = torch.mean(x * z, dim=1)
-    yz = torch.mean(y * z, dim=1)
-    determinant = torch.clamp(xx * yy - xy * xy, min=1.0e-8)
-    slope_x = (xz * yy - yz * xy) / determinant
-    slope_y = (yz * xx - xz * xy) / determinant
-
-    residual = z - slope_x.unsqueeze(1) * x - slope_y.unsqueeze(1) * y
-    residual_rms = torch.sqrt(torch.mean(torch.square(residual), dim=1) + 1.0e-8)
-    normal_yaw = torch.stack((-slope_x, -slope_y, torch.ones_like(slope_x)), dim=1)
-    normal_yaw = torch.nn.functional.normalize(normal_yaw, dim=1)
-    normal_w = math_utils.quat_apply(yaw, normal_yaw)
-    return normal_w, residual_rms, valid
-
-
 def track_lin_vel_xy_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -512,22 +468,15 @@ def feet_contact_without_cmd(env: ManagerBasedRLEnv, command_name: str, sensor_c
     return reward
 
 
-def feet_stumble(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    force_ratio: float = 4.0,
-) -> torch.Tensor:
-    """Penalize feet whose horizontal contact force dominates vertical support."""
-    if force_ratio < 0.0:
-        raise ValueError("force_ratio must be non-negative.")
+def feet_stumble(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    # extract the used quantities (to enable type-hinting)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
-    forces_z = torch.abs(forces[..., 2])
-    forces_xy = torch.linalg.norm(forces[..., :2], dim=2)
-    # A single wheel hitting a near-vertical surface marks the environment.
-    penalty = torch.any(forces_xy > force_ratio * forces_z, dim=1).float()
-    upright_gate = torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
-    return penalty * upright_gate
+    forces_z = torch.abs(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2])
+    forces_xy = torch.linalg.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :2], dim=2)
+    # Penalize feet hitting vertical surfaces
+    reward = torch.any(forces_xy > 4 * forces_z, dim=1).float()
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
 
 
 def feet_distance_y_exp(
@@ -875,31 +824,26 @@ def foot_clearance(
     lift_penalty_scale: float = 1.0,
     terrain_sensor_cfg: SceneEntityCfg | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    yaw_target_height: float | None = None,
-    hover_penalty_scale: float = 0.0,
-    target_centered: bool = False,
-    plane_residual_gate_std: float | None = None,
-    upright_gate: bool = True,
 ) -> torch.Tensor:
-    """Shape wheel clearance during lateral/yaw motion and suppress lift otherwise.
+    """Reward foot-lift height during lin_y/ang_z, penalise it during lin_x-only/standing.
 
     Signed two-state gate on ``lateral_or_rot = norm(cmd[:, 1:3])`` (same
     quantity ``hip_pos``/``wheel_scrub_penalty`` gate on):
 
     - **active** (``lateral_or_rot > command_threshold``, i.e. lin_y or
       ang_z commanded): airborne feet are rewarded for reaching
-      ``target_height`` via an exponential kernel. By default only a clearance
-      deficit is penalized; ``target_centered=True`` shapes both undershoot and
-      overshoot. ``yaw_target_height`` optionally supplies a yaw-specific target.
+      ``target_height`` via the exponential kernel
+      ``exp(-below²/std²)``, ``below = clamp(target_height - clearance, 0)``,
+      ``clearance = foot_pos_z - terrain_z - wheel_radius``.
     - **inactive** (zero command *or* pure lin_x — both collapse to
       ``lateral_or_rot`` being quiet): any positive clearance above the
       wheel radius is *penalised* as ``-lift_penalty_scale * clearance_clamped²``,
       discouraging stepping when the robot should just be rolling on its
       wheels or standing still.
 
-    ``terrain_sensor_cfg`` optionally provides local terrain height. When
-    ``plane_residual_gate_std`` is set, clearance shaping fades at terrain
-    discontinuities such as stair edges.
+    ``terrain_sensor_cfg``: optional RayCaster sensor (e.g. ``height_scanner``).
+    If provided, terrain_z = mean(ray_hits_w[..., 2]) — same approach as
+    ``base_height_l2``.  If None, terrain_z = 0 (flat terrain assumption).
 
     ``max_air_time`` guards against the degenerate "park 2 legs in the air
     forever" solution: a foot's *reward* contribution (active state only) is
@@ -912,18 +856,8 @@ def foot_clearance(
     airborne" failure mode. The inactive-state penalty is NOT decayed by
     air time — the longer a foot hovers when it shouldn't, the worse.
 
-    ``hover_penalty_scale`` adds a penalty after ``max_air_time``. The final
-    upright gate can be disabled for terrain-transition shaping.
+    Recommended weight: +0.5 ~ +2.0
     """
-    if std <= 0.0 or max_air_time <= 0.0:
-        raise ValueError("std and max_air_time must be positive.")
-    if hover_penalty_scale < 0.0 or lift_penalty_scale < 0.0:
-        raise ValueError("clearance penalty scales must be non-negative.")
-    if target_height < 0.0 or (yaw_target_height is not None and yaw_target_height < 0.0):
-        raise ValueError("clearance targets must be non-negative.")
-    if plane_residual_gate_std is not None and plane_residual_gate_std <= 0.0:
-        raise ValueError("plane_residual_gate_std must be positive.")
-
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     asset: Articulation = env.scene[asset_cfg.name]
 
@@ -932,24 +866,13 @@ def foot_clearance(
 
     foot_pos_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # (B, K)
 
-    planar_gate = torch.ones(env.num_envs, device=env.device)
+    # terrain reference height — mirrors base_height_l2's sensor approach
     if terrain_sensor_cfg is not None and terrain_sensor_cfg.name in env.scene.sensors:
         terrain_sensor: RayCaster = env.scene[terrain_sensor_cfg.name]
-        ray_heights = terrain_sensor.data.ray_hits_w[..., 2]
-        finite = torch.isfinite(ray_heights).all(dim=1)
-        finite &= (torch.abs(ray_heights) < 1.0e6).all(dim=1)
-        # Invalid scans fall back per environment instead of contaminating the batch.
-        fallback_z = env.scene.env_origins[:, 2:3]
-        sanitized = torch.where(finite[:, None], ray_heights, fallback_z)
-        terrain_z = torch.mean(sanitized, dim=1, keepdim=True)
-        terrain_z = torch.where(finite[:, None], terrain_z, fallback_z)
-        if plane_residual_gate_std is not None:
-            # Fade clearance shaping where stair edges are poorly modeled by one plane.
-            _, residual, valid = _fit_height_scan_plane_yaw(asset, terrain_sensor)
-            residual_gate = torch.exp(-torch.square(residual / plane_residual_gate_std))
-            planar_gate = torch.where(valid, residual_gate, torch.ones_like(residual_gate))
+        ray_hits_z = terrain_sensor.data.ray_hits_w[..., 2]  # (B, n_rays)
+        terrain_z = torch.mean(ray_hits_z, dim=1, keepdim=True)  # (B, 1) broadcast to (B, K)
     else:
-        terrain_z = torch.zeros_like(foot_pos_z)
+        terrain_z = torch.zeros_like(foot_pos_z)  # flat ground or no sensor
 
     clearance = foot_pos_z - terrain_z - wheel_radius  # (B, K)
 
@@ -959,35 +882,21 @@ def foot_clearance(
     lateral_or_rot = torch.norm(cmd[:, 1:3], dim=1)
     active = (lateral_or_rot > command_threshold).unsqueeze(-1)  # (B, 1)
 
-    clearance_target = torch.full_like(clearance, target_height)
-    if yaw_target_height is not None:
-        yaw_active = (torch.abs(cmd[:, 2]) > command_threshold).unsqueeze(-1)
-        clearance_target = torch.where(
-            yaw_active,
-            torch.full_like(clearance_target, yaw_target_height),
-            clearance_target,
-        )
-    # Centered mode shapes both under- and over-clearance; default mode only under-clearance.
-    height_error = clearance_target - clearance
-    if not target_centered:
-        height_error = torch.clamp(height_error, min=0.0)
-    height_reward = torch.exp(-height_error.pow(2) / std**2)
-
+    # -- active-state term: exponential kernel on clearance deficit, decayed by air time
+    below = torch.clamp(target_height - clearance, min=0.0)
+    height_reward = torch.exp(-below.pow(2) / std**2)
     air_time = sensor.data.current_air_time[:, sensor_cfg.body_ids]  # (B, K)
-    # Reward short supported swings, then penalize feet that remain airborne too long.
     swing_decay = torch.exp(-(air_time / max_air_time).pow(2))
-    hover_excess = torch.clamp((air_time - max_air_time) / max_air_time, min=0.0, max=1.0)
-    hover_penalty = hover_penalty_scale * torch.square(hover_excess)
-    enough_support = (in_contact.float().sum(dim=-1, keepdim=True) >= min_contact).float()
-    active_term = height_reward * swing_decay * enough_support - hover_penalty
+    num_contact = in_contact.float().sum(dim=-1, keepdim=True)  # (B, 1)
+    has_other_contact = (num_contact >= min_contact).float()  # (B, 1)
+    active_term = height_reward * swing_decay * has_other_contact
 
     # -- inactive-state term: penalise any lift above the wheel radius, undecayed
     inactive_term = -lift_penalty_scale * torch.clamp(clearance, min=0.0).pow(2)
 
     reward = in_air.float() * torch.where(active, active_term, inactive_term)  # (B, K)
-    if upright_gate:
-        reward *= (torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7).unsqueeze(-1)
-    return reward.sum(dim=-1) * planar_gate
+
+    return reward.sum(dim=-1) * torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
 
 
 def wheel_roll_reward(

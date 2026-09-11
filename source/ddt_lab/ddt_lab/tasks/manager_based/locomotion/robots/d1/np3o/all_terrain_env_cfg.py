@@ -179,13 +179,12 @@ class D1AllTerrainSceneCfg(SceneCfg):
 
 @configclass
 class AllTerrainCommandsCfg(CommandsCfg):
-    """Velocity commands with explicit forward/reverse pure-X coverage."""
+    """Velocity commands with balanced exact-axis modes."""
 
-    base_velocity = mdp.ModeBalancedVelocityCommandCfg(
-        class_type=mdp.PositionHoldVelocityCommand,
+    base_velocity = mdp.HeightVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(5.0, 5.0),
-        rel_standing_envs=0.05,
+        rel_standing_envs=0.10,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -196,18 +195,10 @@ class AllTerrainCommandsCfg(CommandsCfg):
             ang_vel_z=(-1.0, 1.0),
             heading=(-math.pi, math.pi),
         ),
-        rel_pure_x_envs=0.30,
-        flat_terrain_end=0.10,
-        flat_lin_vel_x=(-1.0, 1.0),
-        flat_rel_standing_envs=0.50,
-        flat_rel_pure_x_envs=0.6647058823529411,
-        terrain_pure_x_start=0.40,
-        terrain_rel_pure_x_envs=70.0 / 95.0,
-        terrain_rel_pure_y_envs=5.0 / 95.0,
-        terrain_rel_pure_yaw_envs=5.0 / 95.0,
-        terrain_pure_x_positive_fraction=0.70,
-        pure_x_min_speed=0.15,
-        pure_y_min_speed=0.15,
+        rel_pure_x_envs=0.60,
+        rel_pure_y_envs=0.05,
+        rel_pure_yaw_envs=0.05,
+        min_linear_speed=0.15,
     )
 
 
@@ -246,7 +237,7 @@ class D1HeightAllTerrainNP3OEnvCfg(D1RoughNP3OEnvCfg):
             resampling_time_range=(5.0, 10.0),
             ranges=mdp.UniformHeightCommandCfg.Ranges(height=(0.17, HEIGHT_RANGE[1])),
         )
-        self.commands.base_velocity.rel_standing_envs = 0.05
+        self.commands.base_velocity.rel_standing_envs = 0.10
         self.commands.base_velocity.rel_heading_envs = 1.0
         self.observations.policy.history_length = 10
         self.observations.policy.flatten_history_dim = False
@@ -504,19 +495,6 @@ class D1HeightAllTerrainNP3OEnvCfg(D1RoughNP3OEnvCfg):
         )
 
     def _configure_curricula_and_terrain(self):
-        self.curriculum.command_levels_lin_vel = CurrTerm(
-            func=mdp.flat_command_levels_lin_vel,
-            params={
-                "command_name": "base_velocity",
-                "reward_term_name": "track_lin_vel_xy_exp",
-                "terrain_type_end": 0.10,
-                "initial_max_speed": 1.0,
-                "final_max_speed": 2.0,
-                "increment": 0.25,
-                "success_threshold": 0.80,
-                "min_samples": 32,
-            },
-        )
         self.curriculum.base_height_cmd = CurrTerm(
             func=mdp.base_height_command_curriculum,
             params={
@@ -634,7 +612,6 @@ def _configure_play(cfg):
     cfg.events.add_base_com = None
     cfg.events.randomize_actuator_gains = None
     cfg.curriculum.terrain_levels = None
-    cfg.curriculum.command_levels_lin_vel = None
     cfg.curriculum.base_height_cmd = None
 
 
